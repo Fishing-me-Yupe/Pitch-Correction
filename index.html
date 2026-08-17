@@ -3,87 +3,57 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>GarageBand Style Pitch Editor</title>
+  <title>Melodyne Style Pitch Editor</title>
+  <!-- タイムストレッチ（音切れ・速度変化なしのピッチ変更）用ライブラリ -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
   <style>
-    * { box-sizing: border-box; user-select: none; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1c1c1e; color: #fff; margin: 0; padding: 15px; text-align: center; }
-    .controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-bottom: 10px; align-items: center; }
-    button { padding: 10px 16px; font-size: 14px; font-weight: bold; border: none; border-radius: 8px; background: #0a84ff; color: white; cursor: pointer; }
-    button:disabled { background: #3a3a3c; color: #7c7c80; cursor: not-allowed; }
-    #downloadBtn { background: #30d158; }
-    #downloadBtn:disabled { background: #3a3a3c; }
-    
-    .zoom-control { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #aaa; background: #2c2c2e; padding: 6px 12px; border-radius: 8px; }
-    .zoom-control input { width: 100px; }
-
-    #editor-container { width: 100%; max-width: 1000px; margin: 0 auto; overflow: hidden; border: 1px solid #38383a; border-radius: 8px; background: #121212; position: relative; }
-    #canvas-wrapper { width: 100%; overflow-x: auto; overflow-y: hidden; touch-action: none; position: relative; }
-    canvas { display: block; background: #1a1a1c; }
-    .status { margin-top: 10px; color: #8e8e93; font-size: 13px; }
+    body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
+    .controls { margin-bottom: 12px; }
+    button { padding: 12px 18px; font-size: 15px; font-weight: bold; margin: 4px; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    #downloadBtn { background: #28a745; }
+    #downloadBtn:disabled { background: #444; }
+    #canvas-container { width: 100%; max-width: 900px; margin: 0 auto; touch-action: none; position: relative; }
+    #editor { width: 100%; height: 380px; border: 1px solid #444; background: #252526; display: block; border-radius: 6px; }
+    .status { margin-top: 10px; color: #aaa; font-size: 14px; }
   </style>
 </head>
 <body>
 
-  <h1>Piano Roll Pitch Editor</h1>
-
+  <h1>Melodyne Style Pitch Editor</h1>
+  
   <div class="controls">
     <button id="recBtn">録音開始</button>
     <button id="playBtn" disabled>再生</button>
-    <button id="downloadBtn" disabled>WAV保存</button>
-    
-    <div class="zoom-control">
-      <span>横拡大:</span>
-      <input type="range" id="zoomSlider" min="1" max="5" step="0.1" value="1">
-    </div>
+    <button id="downloadBtn" disabled>WAVダウンロード</button>
   </div>
 
-  <div id="editor-container">
-    <div id="canvas-wrapper">
-      <canvas id="editor" width="1000" height="400"></canvas>
-    </div>
+  <div id="canvas-container">
+    <canvas id="editor" width="900" height="380"></canvas>
   </div>
-  <div class="status" id="statusText">【操作】タップ/ドラッグでノート配置・移動 ｜ ピンチイン・アウトで横拡大</div>
+  <div class="status" id="statusText">【1本指】ブロック移動 / 【2本指】画面の音域上下スクロール</div>
 
   <script>
     let mediaRecorder;
     let audioChunks = [];
     let audioBuffer = null;
-
-    const KEY_WIDTH = 60;
-    const DISPLAY_NOTES = 25; // 表示音域数
-    let baseMidi = 60;        // 画面最下部のMIDI音高 (C4)
-    let zoomLevel = 1.0;
-
-    // ノートデータ（GarageBand風ブロック）
-    // 各ブロック: { start: 0~1 (進行度), duration: 0~1 (長さ), pitchShift: 半音量 (-12 ~ +12) }
     let notes = [];
+    let selectedNote = null;
+
+    const KEY_WIDTH = 70;
+    const DISPLAY_NOTES = 25; // 1画面に表示する鍵盤数
+    let baseMidi = 60;        // 画面一番下のMIDIノート番号
 
     const recBtn = document.getElementById('recBtn');
     const playBtn = document.getElementById('playBtn');
     const downloadBtn = document.getElementById('downloadBtn');
-    const zoomSlider = document.getElementById('zoomSlider');
     const canvas = document.getElementById('editor');
     const ctx = canvas.getContext('2d');
-    const wrapper = document.getElementById('canvas-wrapper');
     const statusText = document.getElementById('statusText');
 
     const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
     drawEditor();
-
-    // 拡大スライダー処理
-    zoomSlider.addEventListener('input', (e) => {
-      zoomLevel = parseFloat(e.target.value);
-      resizeCanvas();
-      drawEditor();
-    });
-
-    function resizeCanvas() {
-      const baseWidth = wrapper.clientWidth || 1000;
-      canvas.width = Math.max(baseWidth, (baseWidth - KEY_WIDTH) * zoomLevel + KEY_WIDTH);
-    }
-    window.addEventListener('resize', () => { resizeCanvas(); drawEditor(); });
 
     // 録音処理
     recBtn.addEventListener('click', async () => {
@@ -92,7 +62,7 @@
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
         recBtn.textContent = '録音開始';
-        statusText.textContent = '音声処理中...';
+        statusText.textContent = '解析中...';
       } else {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -105,27 +75,105 @@
             const arrayBuffer = await blob.arrayBuffer();
             const actx = new AudioContext();
             audioBuffer = await actx.decodeAudioData(arrayBuffer);
-
-            // 初期ノートを1つ配置（全体に渡る標準ピッチノート）
-            notes = [{ start: 0, duration: 1, pitchShift: 0 }];
-
+            
+            analyzeAudioNotes();
             playBtn.disabled = false;
             downloadBtn.disabled = false;
-            statusText.textContent = 'ピアノロール上のブロックをドラッグして移動／変形できます。';
-            resizeCanvas();
+            statusText.textContent = '編集後、「WAVダウンロード」で書き出せます。';
             drawEditor();
           };
 
           mediaRecorder.start();
           recBtn.textContent = '録音停止';
-          statusText.textContent = '録音中...';
+          statusText.textContent = '録音中... 声を出してください。';
         } catch (err) {
-          statusText.textContent = 'マイクアクセスを許可してください。';
+          statusText.textContent = 'マイクのアクセスを許可してください。';
         }
       }
     });
 
-    // タイムストレッチ（GrainPlayer）による音切れのないピッチ変化再生
+    // ピッチ検出
+    function analyzeAudioNotes() {
+      notes = [];
+      if (!audioBuffer) return;
+
+      const data = audioBuffer.getChannelData(0);
+      const sampleRate = audioBuffer.sampleRate;
+      const chunkSize = Math.floor(sampleRate * 0.1);
+      const totalChunks = Math.floor(data.length / chunkSize);
+
+      let currentNote = null;
+      let detectedMidiss = [];
+
+      for (let i = 0; i < totalChunks; i++) {
+        const startSample = i * chunkSize;
+        const slice = data.subarray(startSample, startSample + chunkSize);
+        const midi = detectPitchMIDI(slice, sampleRate);
+
+        if (midi !== null) {
+          detectedMidiss.push(midi);
+          if (currentNote && currentNote.midi === midi) {
+            currentNote.lengthSamples += chunkSize;
+            currentNote.duration += 0.1;
+          } else {
+            if (currentNote) notes.push(currentNote);
+            currentNote = {
+              id: Date.now() + i,
+              startSample: startSample,
+              lengthSamples: chunkSize,
+              startTime: i * 0.1,
+              duration: 0.1,
+              midi: midi,
+              offset: 0
+            };
+          }
+        } else {
+          if (currentNote) {
+            notes.push(currentNote);
+            currentNote = null;
+          }
+        }
+      }
+      if (currentNote) notes.push(currentNote);
+
+      if (detectedMidiss.length > 0) {
+        const avgMidi = Math.round(detectedMidiss.reduce((a, b) => a + b) / detectedMidiss.length);
+        baseMidi = Math.max(36, Math.min(84, avgMidi - Math.floor(DISPLAY_NOTES / 2)));
+      }
+    }
+
+    function detectPitchMIDI(buffer, sampleRate) {
+      let sum = 0;
+      for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
+      let rms = Math.sqrt(sum / buffer.length);
+      if (rms < 0.02) return null;
+
+      let r1 = 0, r2 = buffer.length - 1, thres = 0.2;
+      for (let i = 0; i < buffer.length / 2; i++) if (Math.abs(buffer[i]) < thres) { r1 = i; break; }
+      for (let i = 1; i < buffer.length / 2; i++) if (Math.abs(buffer[buffer.length - i]) < thres) { r2 = buffer.length - i; break; }
+      let sliced = buffer.subarray(r1, r2);
+
+      let c = new Float32Array(sliced.length);
+      for (let i = 0; i < sliced.length; i++) {
+        for (let j = 0; j < sliced.length - i; j++) {
+          c[i] += sliced[j] * sliced[j + i];
+        }
+      }
+
+      let d = 0; while (c[d] > c[d + 1]) d++;
+      let maxval = -1, maxpos = -1;
+      for (let i = d; i < sliced.length; i++) {
+        if (c[i] > maxval) { maxval = c[i]; maxpos = i; }
+      }
+      if (maxpos === -1) return null;
+
+      let freq = sampleRate / maxpos;
+      if (freq < 80 || freq > 1200) return null;
+
+      return Math.round(12 * Math.log2(freq / 440) + 69);
+    }
+
+    // 再生処理（Tone.GrainPlayerにより速度を変えずにピッチのみ変更）
     let isPlaying = false;
     playBtn.addEventListener('click', async () => {
       if (!audioBuffer || isPlaying) return;
@@ -134,14 +182,13 @@
       isPlaying = true;
       playBtn.disabled = true;
 
+      const duration = audioBuffer.duration;
       const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
       const player = new Tone.GrainPlayer(toneBuffer).toDestination();
       player.grainSize = 0.08;
       player.overlap = 0.04;
 
-      const duration = audioBuffer.duration;
       const startTime = Tone.now();
-
       player.start(startTime);
 
       const updateInterval = setInterval(() => {
@@ -155,235 +202,21 @@
           return;
         }
 
-        const progress = elapsed / duration;
+        // 現在の再生時刻に位置する音符ブロックのピッチシフト（offset）を適用
+        const activeNote = notes.find(n => elapsed >= n.startTime && elapsed <= (n.startTime + n.duration));
+        player.pitchShift = activeNote ? activeNote.offset : 0;
 
-        // 現在位置にあるノートのピッチを適用
-        const activeNote = notes.find(n => progress >= n.start && progress <= (n.start + n.duration));
-        player.pitchShift = activeNote ? activeNote.pitchShift : 0;
-
-        drawEditor(progress);
+        drawEditor(elapsed / duration);
       }, 20);
     });
 
-    // エディタ描画
-    function drawEditor(playProgress = null) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const noteHeight = canvas.height / DISPLAY_NOTES;
-      const maxMidi = baseMidi + DISPLAY_NOTES - 1;
-      const timeWidth = canvas.width - KEY_WIDTH;
-
-      // 1. グリッド線 ＆ 背景
-      for (let i = 0; i < DISPLAY_NOTES; i++) {
-        const midi = maxMidi - i;
-        const y = i * noteHeight;
-        const isBlack = [1, 3, 6, 8, 10].includes(midi % 12);
-
-        ctx.fillStyle = isBlack ? '#161618' : '#222224';
-        ctx.fillRect(KEY_WIDTH, y, timeWidth, noteHeight);
-
-        ctx.strokeStyle = '#2c2c2e';
-        ctx.beginPath();
-        ctx.moveTo(KEY_WIDTH, y);
-        ctx.lineTo(canvas.width, y);
-        ctx.stroke();
-      }
-
-      // 縦の小節/時間ガイド線
-      const steps = 16 * Math.ceil(zoomLevel);
-      for (let i = 0; i <= steps; i++) {
-        const x = KEY_WIDTH + (i / steps) * timeWidth;
-        ctx.strokeStyle = i % 4 === 0 ? '#444' : '#2a2a2c';
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
-        ctx.stroke();
-      }
-
-      // 2. 左側ピアノキー
-      for (let i = 0; i < DISPLAY_NOTES; i++) {
-        const midi = maxMidi - i;
-        const y = i * noteHeight;
-        const noteIndex = midi % 12;
-        const isBlack = [1, 3, 6, 8, 10].includes(noteIndex);
-
-        ctx.fillStyle = isBlack ? '#000000' : '#e5e5ea';
-        ctx.fillRect(0, y, KEY_WIDTH - 2, noteHeight - 1);
-
-        if (noteIndex === 0 || noteIndex === 5 || noteIndex === 7) {
-          ctx.fillStyle = isBlack ? '#fff' : '#000';
-          ctx.font = '10px sans-serif';
-          ctx.textAlign = 'right';
-          ctx.fillText(noteNames[noteIndex] + Math.floor(midi / 12 - 1), KEY_WIDTH - 6, y + noteHeight - 3);
-        }
-      }
-
-      // 3. GarageBand風ノートブロック（緑色バー）
-      const centerY = canvas.height / 2;
-      notes.forEach((note) => {
-        const x = KEY_WIDTH + note.start * timeWidth;
-        const w = Math.max(12, note.duration * timeWidth);
-        const y = centerY - (note.pitchShift * noteHeight) - (noteHeight / 2);
-
-        // バー本体
-        ctx.fillStyle = '#30d158';
-        ctx.beginPath();
-        ctx.roundRect(x + 1, y + 1, w - 2, noteHeight - 2, 4);
-        ctx.fill();
-
-        // 枠線 ＆ 右端のリサイズハンドル表示
-        ctx.strokeStyle = '#28a745';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(x + w - 5, y + 3, 3, noteHeight - 6);
-      });
-
-      // 4. 再生ヘッド（赤線）
-      if (playProgress !== null) {
-        const playX = KEY_WIDTH + playProgress * timeWidth;
-        ctx.strokeStyle = '#ff453a';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(playX, 0);
-        ctx.lineTo(playX, canvas.height);
-        ctx.stroke();
-      }
-    }
-
-    // タッチ / ドラッグ / ピンチズーム操作
-    let selectedNote = null;
-    let isResizing = false;
-    let dragStartX = 0;
-    let dragStartY = 0;
-    let originalStart = 0;
-    let originalShift = 0;
-    let originalDuration = 0;
-
-    let initialPinchDist = null;
-    let initialZoom = 1;
-
-    function getCoords(e) {
-      const rect = canvas.getBoundingClientRect();
-      const touch = (e.touches && e.touches.length > 0) ? e.touches[0] : e;
-      return {
-        x: (touch.clientX - rect.left),
-        y: (touch.clientY - rect.top)
-      };
-    }
-
-    function handleStart(e) {
-      // ピンチズーム処理 (2本指)
-      if (e.touches && e.touches.length === 2) {
-        const dx = e.touches[0].clientX - e.touches[1].clientX;
-        const dy = e.touches[0].clientY - e.touches[1].clientY;
-        initialPinchDist = Math.hypot(dx, dy);
-        initialZoom = zoomLevel;
-        return;
-      }
-
-      const pos = getCoords(e);
-      if (pos.x < KEY_WIDTH || !audioBuffer) return;
-
-      const timeWidth = canvas.width - KEY_WIDTH;
-      const progress = (pos.x - KEY_WIDTH) / timeWidth;
-      const noteHeight = canvas.height / DISPLAY_NOTES;
-      const centerY = canvas.height / 2;
-
-      // 既存ノートの判定
-      selectedNote = notes.find(note => {
-        const x = KEY_WIDTH + note.start * timeWidth;
-        const w = note.duration * timeWidth;
-        const y = centerY - (note.pitchShift * noteHeight) - (noteHeight / 2);
-        return pos.x >= x && pos.x <= (x + w) && pos.y >= y && pos.y <= (y + noteHeight);
-      });
-
-      if (selectedNote) {
-        const noteX = KEY_WIDTH + selectedNote.start * timeWidth;
-        const noteW = selectedNote.duration * timeWidth;
-        
-        // 右端タップで長さ変更 (Resize)
-        if (pos.x >= noteX + noteW - 12) {
-          isResizing = true;
-        } else {
-          isResizing = false;
-        }
-
-        dragStartX = pos.x;
-        dragStartY = pos.y;
-        originalStart = selectedNote.start;
-        originalShift = selectedNote.pitchShift;
-        originalDuration = selectedNote.duration;
-      } else {
-        // 空白部分タップで新規ノート追加
-        const shift = Math.round((centerY - pos.y) / noteHeight);
-        const newNote = {
-          start: Math.max(0, progress),
-          duration: 0.15,
-          pitchShift: Math.max(-12, Math.min(12, shift))
-        };
-        notes.push(newNote);
-        drawEditor();
-      }
-    }
-
-    function handleMove(e) {
-      // ピンチズーム（2本指拡大）
-      if (e.touches && e.touches.length === 2 && initialPinchDist) {
-        const dx = e.touches[0].clientX - e.touches[1].clientX;
-        const dy = e.touches[0].clientY - e.touches[1].clientY;
-        const dist = Math.hypot(dx, dy);
-        const factor = dist / initialPinchDist;
-
-        zoomLevel = Math.max(1.0, Math.min(5.0, initialZoom * factor));
-        zoomSlider.value = zoomLevel;
-        resizeCanvas();
-        drawEditor();
-        if (e.cancelable) e.preventDefault();
-        return;
-      }
-
-      if (!selectedNote) return;
-
-      const pos = getCoords(e);
-      const timeWidth = canvas.width - KEY_WIDTH;
-      const noteHeight = canvas.height / DISPLAY_NOTES;
-
-      if (isResizing) {
-        const deltaX = (pos.x - dragStartX) / timeWidth;
-        selectedNote.duration = Math.max(0.05, originalDuration + deltaX);
-      } else {
-        const deltaX = (pos.x - dragStartX) / timeWidth;
-        const deltaY = pos.y - dragStartY;
-
-        selectedNote.start = Math.max(0, Math.min(1 - selectedNote.duration, originalStart + deltaX));
-        const shiftChange = Math.round(-deltaY / noteHeight);
-        selectedNote.pitchShift = Math.max(-12, Math.min(12, originalShift + shiftChange));
-      }
-
-      drawEditor();
-      if (e.cancelable) e.preventDefault();
-    }
-
-    function handleEnd() {
-      selectedNote = null;
-      initialPinchDist = null;
-    }
-
-    canvas.addEventListener('mousedown', handleStart);
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleEnd);
-
-    canvas.addEventListener('touchstart', handleStart, { passive: false });
-    window.addEventListener('touchmove', handleMove, { passive: false });
-    window.addEventListener('touchend', handleEnd);
-
-    // WAVファイル書き出し
+    // WAVダウンロード処理（書き出しもGrainPlayerでレンダリング）
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
-      statusText.textContent = 'レンダリング中...';
+      statusText.textContent = 'WAVファイルをレンダリング中...';
 
       const duration = audioBuffer.duration;
+
       const renderedBuffer = await Tone.Offline(async () => {
         const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
         const player = new Tone.GrainPlayer(toneBuffer).toDestination();
@@ -391,21 +224,23 @@
         player.overlap = 0.04;
         player.start(0);
 
-        // 時間経過に合わせてノートのピッチを適用
+        // 各ブロックのタイマーに合わせてピッチを変更
         notes.forEach(note => {
-          const startTime = note.start * duration;
-          player.pitchShift = note.pitchShift;
+          Tone.Transport.schedule(() => {
+            player.pitchShift = note.offset;
+          }, note.startTime);
         });
+        Tone.Transport.start();
       }, duration);
 
       const wavBlob = audioBufferToWav(renderedBuffer.get());
       const url = URL.createObjectURL(wavBlob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'pitch_edited.wav';
+      a.download = 'pitch_corrected.wav';
       a.click();
 
-      statusText.textContent = 'ダウンロードが完了しました！';
+      statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
     });
 
     function audioBufferToWav(buffer) {
@@ -413,6 +248,7 @@
       const sampleRate = buffer.sampleRate;
       const format = 1;
       const bitDepth = 16;
+      
       let samples = buffer.getChannelData(0);
       let length = samples.length * 2 + 44;
       let bufferArray = new ArrayBuffer(length);
@@ -428,6 +264,7 @@
       writeString('RIFF');
       view.setUint32(pos, length - 8, true); pos += 4;
       writeString('WAVE');
+
       writeString('fmt ');
       view.setUint32(pos, 16, true); pos += 4;
       view.setUint16(pos, format, true); pos += 2;
@@ -436,6 +273,7 @@
       view.setUint32(pos, sampleRate * numOfChan * (bitDepth / 8), true); pos += 4;
       view.setUint16(pos, numOfChan * (bitDepth / 8), true); pos += 2;
       view.setUint16(pos, bitDepth, true); pos += 2;
+
       writeString('data');
       view.setUint32(pos, length - pos - 4, true); pos += 4;
 
@@ -446,6 +284,191 @@
 
       return new Blob([view.buffer], { type: 'audio/wav' });
     }
+
+    // 画面描画
+    function drawEditor(playProgress = null) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const noteHeight = canvas.height / DISPLAY_NOTES;
+      const maxMidi = baseMidi + DISPLAY_NOTES - 1;
+
+      for (let i = 0; i < DISPLAY_NOTES; i++) {
+        const midi = maxMidi - i;
+        const y = i * noteHeight;
+        const isBlack = [1, 3, 6, 8, 10].includes(midi % 12);
+
+        ctx.fillStyle = isBlack ? '#1a1a1a' : '#252526';
+        ctx.fillRect(KEY_WIDTH, y, canvas.width - KEY_WIDTH, noteHeight);
+
+        ctx.strokeStyle = '#333';
+        ctx.beginPath();
+        ctx.moveTo(KEY_WIDTH, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+
+      for (let i = 0; i < DISPLAY_NOTES; i++) {
+        const midi = maxMidi - i;
+        const y = i * noteHeight;
+        const noteIndex = midi % 12;
+        const isBlack = [1, 3, 6, 8, 10].includes(noteIndex);
+
+        ctx.fillStyle = isBlack ? '#111' : '#eee';
+        ctx.fillRect(0, y, KEY_WIDTH - 2, noteHeight - 1);
+
+        if (noteIndex === 0 || noteIndex === 5 || noteIndex === 7) {
+          ctx.fillStyle = isBlack ? '#fff' : '#000';
+          ctx.font = '10px sans-serif';
+          ctx.textAlign = 'right';
+          let label = noteNames[noteIndex] + Math.floor(midi / 12 - 1);
+          if (midi === 72) label = "hiC (C5)";
+          if (midi === 77) label = "hiF (F5)";
+          if (midi === 79) label = "hiG (G5)";
+          ctx.fillText(label, KEY_WIDTH - 6, y + noteHeight - 3);
+        }
+      }
+
+      if (audioBuffer && notes.length > 0) {
+        const totalDuration = audioBuffer.duration;
+        const timelineWidth = canvas.width - KEY_WIDTH;
+
+        notes.forEach(note => {
+          const currentMidi = note.midi + note.offset;
+          
+          if (currentMidi >= baseMidi && currentMidi <= maxMidi) {
+            const yIndex = maxMidi - currentMidi;
+            const y = yIndex * noteHeight;
+            const x = KEY_WIDTH + (note.startTime / totalDuration) * timelineWidth;
+            const w = (note.duration / totalDuration) * timelineWidth;
+
+            note.renderX = x;
+            note.renderY = y;
+            note.renderW = w;
+            note.renderH = noteHeight;
+
+            ctx.fillStyle = (note.offset !== 0) ? '#ff9500' : '#00bfff';
+            ctx.fillRect(x + 1, y + 1, Math.max(w - 2, 4), noteHeight - 2);
+
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.textAlign = 'left';
+            const name = noteNames[currentMidi % 12];
+            if (w > 20) ctx.fillText(name, x + 4, y + noteHeight - 3);
+          } else {
+            note.renderX = -999;
+          }
+        });
+
+        // 再生ヘッド（赤線）
+        if (playProgress !== null) {
+          const playX = KEY_WIDTH + playProgress * timelineWidth;
+          ctx.strokeStyle = '#ff0055';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(playX, 0);
+          ctx.lineTo(playX, canvas.height);
+          ctx.stroke();
+        }
+
+      } else if (!audioBuffer) {
+        ctx.fillStyle = '#666';
+        ctx.font = '15px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('ここに音階ブロックが表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
+      }
+    }
+
+    // タッチ＆マウス操作ハンドラ
+    let isDragging = false;
+    let isTwoFingerScroll = false;
+    let startY = 0;
+    let twoFingerStartY = 0;
+
+    function getCanvasCoords(e) {
+      const rect = canvas.getBoundingClientRect();
+      const touch = (e.touches && e.touches.length > 0) ? e.touches[0] : e;
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+
+      return {
+        x: (touch.clientX - rect.left) * scaleX,
+        y: (touch.clientY - rect.top) * scaleY
+      };
+    }
+
+    function handleStart(e) {
+      if (e.touches && e.touches.length === 2) {
+        isTwoFingerScroll = true;
+        isDragging = false;
+        selectedNote = null;
+        twoFingerStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        if (e.cancelable) e.preventDefault();
+        return;
+      }
+
+      const pos = getCanvasCoords(e);
+      if (pos.x < KEY_WIDTH) return;
+
+      selectedNote = notes.find(n => 
+        pos.x >= n.renderX && pos.x <= n.renderX + n.renderW
+      );
+
+      if (selectedNote) {
+        isDragging = true;
+        isTwoFingerScroll = false;
+        startY = pos.y;
+        if (e.cancelable) e.preventDefault();
+      }
+    }
+
+    function handleMove(e) {
+      if (isTwoFingerScroll && e.touches && e.touches.length === 2) {
+        const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        const deltaY = currentY - twoFingerStartY;
+        const noteHeight = canvas.height / DISPLAY_NOTES;
+
+        const shift = Math.round(deltaY / (noteHeight * 1.2));
+        if (shift !== 0) {
+          baseMidi = Math.max(24, Math.min(96, baseMidi + shift));
+          twoFingerStartY = currentY;
+          drawEditor();
+        }
+        if (e.cancelable) e.preventDefault();
+        return;
+      }
+
+      if (isDragging && selectedNote) {
+        const pos = getCanvasCoords(e);
+        const noteHeight = canvas.height / DISPLAY_NOTES;
+        
+        const deltaY = startY - pos.y;
+        const semitoneShift = Math.round(deltaY / noteHeight);
+
+        if (semitoneShift !== 0) {
+          selectedNote.offset += semitoneShift;
+          startY = pos.y;
+          drawEditor();
+        }
+        if (e.cancelable) e.preventDefault();
+      }
+    }
+
+    function handleEnd(e) {
+      if (!e.touches || e.touches.length === 0) {
+        isDragging = false;
+        isTwoFingerScroll = false;
+        selectedNote = null;
+      } else if (e.touches && e.touches.length === 1) {
+        isTwoFingerScroll = false;
+      }
+    }
+
+    canvas.addEventListener('mousedown', handleStart);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleEnd);
+
+    canvas.addEventListener('touchstart', handleStart, { passive: false });
+    window.addEventListener('touchmove', handleMove, { passive: false });
+    window.addEventListener('touchend', handleEnd);
   </script>
 </body>
 </html>
