@@ -3,20 +3,20 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Pitch Corrector</title>
+  <title>Piano Roll Pitch Corrector</title>
   <style>
-    body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
-    .controls { margin-bottom: 15px; }
-    button { padding: 12px 20px; font-size: 16px; margin: 5px; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; }
-    button:disabled { background: #555; cursor: not-allowed; }
-    #canvas-container { width: 100%; max-width: 800px; margin: 0 auto; touch-action: none; }
-    #editor { width: 100%; height: 300px; border: 1px solid #444; background: #252526; display: block; cursor: pointer; border-radius: 8px; }
-    .status { margin-top: 12px; color: #aaa; font-size: 14px; }
+    body { font-family: sans-serif; background: #181818; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
+    .controls { margin-bottom: 12px; }
+    button { padding: 12px 20px; font-size: 15px; font-weight: bold; margin: 4px; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    #canvas-container { width: 100%; max-width: 900px; margin: 0 auto; touch-action: none; }
+    #editor { width: 100%; height: 420px; border: 1px solid #333; background: #222; display: block; border-radius: 6px; }
+    .status { margin-top: 10px; color: #aaa; font-size: 14px; }
   </style>
 </head>
 <body>
 
-  <h1>Pitch Corrector</h1>
+  <h1>Piano Roll Pitch Corrector</h1>
   
   <div class="controls">
     <button id="recBtn">録音開始</button>
@@ -24,16 +24,21 @@
   </div>
 
   <div id="canvas-container">
-    <canvas id="editor" width="800" height="300"></canvas>
+    <canvas id="editor" width="900" height="420"></canvas>
   </div>
-  <div class="status" id="statusText">録音ボタンを押して声を録音してください。</div>
+  <div class="status" id="statusText">録音ボタンを押して歌や声を録音してください。</div>
 
   <script>
     let audioCtx;
     let mediaRecorder;
     let audioChunks = [];
     let audioBuffer = null;
-    let pitchOffset = 0; // 半音単位のシフト量
+    
+    // ピッチ解析・ノートデータ
+    let notes = []; // { startTime, endTime, originalMidi, currentMidi }
+    let minMidi = 48; // C3
+    let maxMidi = 84; // C6
+    const KEY_WIDTH = 70;
 
     const recBtn = document.getElementById('recBtn');
     const playBtn = document.getElementById('playBtn');
@@ -41,16 +46,18 @@
     const ctx = canvas.getContext('2d');
     const statusText = document.getElementById('statusText');
 
+    const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
     drawEditor();
 
-    // 録音処理
+    // 1. 録音処理
     recBtn.addEventListener('click', async () => {
       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
         recBtn.textContent = '録音開始';
-        statusText.textContent = '録音完了。波形を上下にスワイプ／ドラッグしてピッチを変更できます。';
+        statusText.textContent = '解析中...';
       } else {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -62,8 +69,11 @@
             const blob = new Blob(audioChunks, { type: 'audio/wav' });
             const arrayBuffer = await blob.arrayBuffer();
             audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            
+            // 音声をピッチ解析してノート化
+            analyzeAudio(audioBuffer);
             playBtn.disabled = false;
-            pitchOffset = 0;
+            statusText.textContent = '解析完了。音ブロックを上下ドラッグして個別にピッチ変更できます。';
             drawEditor();
           };
 
@@ -76,122 +86,286 @@
       }
     });
 
-    // 再生処理
-    playBtn.addEventListener('click', () => {
-      if (!audioBuffer) return;
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      
-      const source = audioCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.playbackRate.value = Math.pow(2, pitchOffset / 12);
+    // 2. 音声解析（ピッチ検出 ＆ ノート分割）
+    function analyzeAudio(buffer) {
+      const data = buffer.getChannelData(0);
+      const sampleRate = buffer.sampleRate;
+      const frameSize = 2048;
+      const hopSize = 512;
+      const numFrames = Math.floor((data.length - frameSize) / hopSize);
 
-      source.connect(audioCtx.destination);
-      source.start();
-    });
-
-    // 実際の音声波形（Waveform）を描画
-    function drawEditor() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // ガイドライン（ピッチ位置）
-      ctx.strokeStyle = '#333';
-      ctx.lineWidth = 1;
-      for (let y = 0; y < canvas.height; y += 25) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
-        ctx.stroke();
+      let rawPitches = [];
+      for (let f = 0; f < numFrames; f++) {
+        const start = f * hopSize;
+        const time = start / sampleRate;
+        const slice = data.subarray(start, start + frameSize);
+        const freq = detectPitch(slice, sampleRate);
+        
+        if (freq > 60 && freq < 1200) { // ボーカル想定周波数帯域
+          const midi = Math.round(69 + 12 * Math.log2(freq / 440));
+          rawPitches.push({ time, midi });
+        } else {
+          rawPitches.push({ time, midi: null });
+        }
       }
 
-      // ピッチ0の基準線
-      ctx.strokeStyle = '#555';
-      ctx.beginPath();
-      ctx.moveTo(0, canvas.height / 2);
-      ctx.lineTo(canvas.width, canvas.height / 2);
-      ctx.stroke();
+      // 連続するフレームを1つの音ブロックに結合
+      notes = [];
+      let currentNote = null;
+      const frameDuration = hopSize / sampleRate;
 
-      if (audioBuffer) {
-        const data = audioBuffer.getChannelData(0);
-        const step = Math.ceil(data.length / canvas.width);
-        const amp = 45; // 波形の縦幅調整
-        const centerY = (canvas.height / 2) - (pitchOffset * 12); // ピッチ変更で波形全体が上下
-
-        // 波形描画
-        ctx.beginPath();
-        ctx.strokeStyle = '#00bfff';
-        ctx.lineWidth = 1.5;
-
-        for (let i = 0; i < canvas.width; i++) {
-          const sampleIndex = i * step;
-          let min = 1.0;
-          let max = -1.0;
-
-          for (let j = 0; j < step; j++) {
-            const datum = data[sampleIndex + j];
-            if (datum < min) min = datum;
-            if (datum > max) max = datum;
+      for (let i = 0; i < rawPitches.length; i++) {
+        const p = rawPitches[i];
+        if (p.midi !== null) {
+          if (!currentNote) {
+            currentNote = { startTime: p.time, endTime: p.time + frameDuration, midis: [p.midi] };
+          } else {
+            const lastMidi = currentNote.midis[currentNote.midis.length - 1];
+            if (Math.abs(p.midi - lastMidi) <= 2) {
+              currentNote.endTime = p.time + frameDuration;
+              currentNote.midis.push(p.midi);
+            } else {
+              finalizeNote(currentNote);
+              currentNote = { startTime: p.time, endTime: p.time + frameDuration, midis: [p.midi] };
+            }
           }
-
-          const y1 = centerY + (min * amp);
-          const y2 = centerY + (max * amp);
-
-          ctx.moveTo(i, y1);
-          ctx.lineTo(i, y2);
+        } else if (currentNote) {
+          finalizeNote(currentNote);
+          currentNote = null;
         }
-        ctx.stroke();
+      }
+      if (currentNote) finalizeNote(currentNote);
 
-        // ステータス表示
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 16px sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText(`ピッチ補正: ${pitchOffset > 0 ? '+' : ''}${pitchOffset} 半音`, 20, 30);
+      // 表示の音域レンジを自動調整
+      if (notes.length > 0) {
+        const allMidis = notes.map(n => n.originalMidi);
+        minMidi = Math.max(24, Math.min(...allMidis) - 4);
+        maxMidi = Math.min(108, Math.max(...allMidis) + 4);
       } else {
-        ctx.fillStyle = '#666';
-        ctx.font = '16px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('ここに波形が表示されます', canvas.width / 2, canvas.height / 2);
+        minMidi = 48; maxMidi = 84;
       }
     }
 
-    // マウス・タッチ操作の共通ハンドラ
-    let isDragging = false;
-    let startY = 0;
+    function finalizeNote(n) {
+      if (n.endTime - n.startTime >= 0.08) { // 80ms以上を音として認定
+        const counts = {};
+        n.midis.forEach(m => counts[m] = (counts[m] || 0) + 1);
+        const modeMidi = parseInt(Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b));
+        notes.push({
+          startTime: n.startTime,
+          endTime: n.endTime,
+          originalMidi: modeMidi,
+          currentMidi: modeMidi
+        });
+      }
+    }
 
-    function getPosPointerY(e) {
-      return (e.touches && e.touches.length > 0) ? e.touches[0].clientY : e.clientY;
+    // 自己相関法（Autocorrelation）によるピッチ検出
+    function detectPitch(buf, sampleRate) {
+      let rms = 0;
+      for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
+      if (Math.sqrt(rms / buf.length) < 0.02) return -1;
+
+      let minPeriod = Math.floor(sampleRate / 1200);
+      let maxPeriod = Math.floor(sampleRate / 70);
+      let bestCorr = 0, bestPeriod = -1;
+
+      for (let p = minPeriod; p <= maxPeriod; p++) {
+        let corr = 0;
+        for (let i = 0; i < buf.length - p; i++) corr += Math.abs(buf[i] - buf[i + p]);
+        corr = 1 - (corr / (buf.length - p));
+        if (corr > bestCorr && corr > 0.75) {
+          bestCorr = corr;
+          bestPeriod = p;
+        }
+      }
+      return bestPeriod !== -1 ? sampleRate / bestPeriod : -1;
+    }
+
+    // 3. ピッチ移動を反映した分割再生
+    playBtn.addEventListener('click', () => {
+      if (!audioBuffer) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+
+      const now = audioCtx.currentTime;
+      let lastTime = 0;
+
+      notes.forEach(note => {
+        // 音ブロック間の無音/未補正部分
+        if (note.startTime > lastTime) {
+          playSlice(lastTime, note.startTime, 0, now + lastTime);
+        }
+        // ピッチ変更された音ブロック部分
+        const semitones = note.currentMidi - note.originalMidi;
+        playSlice(note.startTime, note.endTime, semitones, now + note.startTime);
+        lastTime = note.endTime;
+      });
+
+      if (lastTime < audioBuffer.duration) {
+        playSlice(lastTime, audioBuffer.duration, 0, now + lastTime);
+      }
+    });
+
+    function playSlice(startSec, endSec, semitones, when) {
+      const sr = audioBuffer.sampleRate;
+      const startSample = Math.floor(startSec * sr);
+      const endSample = Math.min(Math.floor(endSec * sr), audioBuffer.length);
+      const len = endSample - startSample;
+      if (len <= 0) return;
+
+      const sliceBuf = audioCtx.createBuffer(audioBuffer.numberOfChannels, len, sr);
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        sliceBuf.copyToChannel(audioBuffer.getChannelData(c).subarray(startSample, endSample), c);
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = sliceBuf;
+      src.playbackRate.value = Math.pow(2, semitones / 12);
+      src.connect(audioCtx.destination);
+      src.start(when);
+    }
+
+    // 4. GUI（Piano Roll ＆ 描画処理）
+    function midiToY(midi) {
+      const noteH = canvas.height / (maxMidi - minMidi + 1);
+      return (maxMidi - midi) * noteH;
+    }
+
+    function yToMidi(y) {
+      const noteH = canvas.height / (maxMidi - minMidi + 1);
+      return maxMidi - Math.floor(y / noteH);
+    }
+
+    function midiToNoteName(midi) {
+      return `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
+    }
+
+    function drawEditor() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const totalNotes = maxMidi - minMidi + 1;
+      const noteH = canvas.height / totalNotes;
+
+      // ピアノ鍵盤 ＆ 横グリッド描画
+      for (let m = maxMidi; m >= minMidi; m--) {
+        const y = midiToY(m);
+        const isBlack = [1, 3, 6, 8, 10].includes(m % 12);
+
+        // 背景グリッド
+        ctx.fillStyle = isBlack ? '#1a1a1a' : '#262626';
+        ctx.fillRect(KEY_WIDTH, y, canvas.width - KEY_WIDTH, noteH);
+
+        ctx.strokeStyle = '#333';
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+
+        // 左側 ピアノ鍵盤
+        ctx.fillStyle = isBlack ? '#111' : '#eee';
+        ctx.fillRect(0, y, KEY_WIDTH, noteH - 1);
+
+        ctx.fillStyle = isBlack ? '#aaa' : '#222';
+        ctx.font = `${Math.min(12, Math.max(9, noteH - 3))}px sans-serif`;
+        ctx.textAlign = 'right';
+        ctx.fillText(midiToNoteName(m), KEY_WIDTH - 6, y + noteH - 3);
+      }
+
+      // 音ブロック（ノート）描画
+      if (audioBuffer && notes.length > 0) {
+        const dur = audioBuffer.duration;
+        const plotW = canvas.width - KEY_WIDTH;
+
+        notes.forEach((note, idx) => {
+          const x = KEY_WIDTH + (note.startTime / dur) * plotW;
+          const w = Math.max(10, ((note.endTime - note.startTime) / dur) * plotW);
+          const y = midiToY(note.currentMidi);
+          const isShifted = note.currentMidi !== note.originalMidi;
+          const isSelected = idx === selectedNoteIndex;
+
+          ctx.fillStyle = isSelected ? '#ff9800' : (isShifted ? '#00e676' : '#00b0ff');
+          ctx.beginPath();
+          ctx.roundRect(x, y + 1, w, noteH - 2, 4);
+          ctx.fill();
+
+          ctx.strokeStyle = isSelected ? '#fff' : 'rgba(0,0,0,0.4)';
+          ctx.lineWidth = isSelected ? 2 : 1;
+          ctx.stroke();
+
+          if (w > 22) {
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.textAlign = 'left';
+            let label = midiToNoteName(note.currentMidi);
+            if (isShifted) {
+              const diff = note.currentMidi - note.originalMidi;
+              label += `(${diff > 0 ? '+' : ''}${diff})`;
+            }
+            ctx.fillText(label, x + 4, y + noteH - 4);
+          }
+        });
+      } else if (!audioBuffer) {
+        ctx.fillStyle = '#777';
+        ctx.font = '16px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('声を録音するとここに音ブロックが表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
+      }
+    }
+
+    // 5. タッチ・マウスによる音ブロック操作
+    let selectedNoteIndex = -1;
+    let isDragging = false;
+
+    function getCanvasPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = (e.touches && e.touches.length > 0) ? e.touches[0].clientX : e.clientX;
+      const clientY = (e.touches && e.touches.length > 0) ? e.touches[0].clientY : e.clientY;
+      return {
+        x: (clientX - rect.left) * (canvas.width / rect.width),
+        y: (clientY - rect.top) * (canvas.height / rect.height)
+      };
     }
 
     function handleStart(e) {
       if (!audioBuffer) return;
-      isDragging = true;
-      startY = getPosPointerY(e);
-      if (e.cancelable) e.preventDefault();
+      const pos = getCanvasPos(e);
+      if (pos.x < KEY_WIDTH) return;
+
+      const dur = audioBuffer.duration;
+      const plotW = canvas.width - KEY_WIDTH;
+      const noteH = canvas.height / (maxMidi - minMidi + 1);
+
+      selectedNoteIndex = -1;
+      notes.forEach((note, idx) => {
+        const x = KEY_WIDTH + (note.startTime / dur) * plotW;
+        const w = Math.max(10, ((note.endTime - note.startTime) / dur) * plotW);
+        const y = midiToY(note.currentMidi);
+
+        if (pos.x >= x && pos.x <= x + w && pos.y >= y && pos.y <= y + noteH) {
+          selectedNoteIndex = idx;
+          isDragging = true;
+        }
+      });
+
+      drawEditor();
+      if (isDragging && e.cancelable) e.preventDefault();
     }
 
     function handleMove(e) {
-      if (!isDragging) return;
-      const currentY = getPosPointerY(e);
-      const deltaY = startY - currentY;
-      
-      const semitoneChange = Math.round(deltaY / 12);
-      if (semitoneChange !== 0) {
-        pitchOffset += semitoneChange;
-        startY = currentY;
+      if (!isDragging || selectedNoteIndex === -1) return;
+      const pos = getCanvasPos(e);
+      const targetMidi = yToMidi(pos.y);
+      const clampedMidi = Math.max(minMidi, Math.min(maxMidi, targetMidi));
+
+      if (notes[selectedNoteIndex].currentMidi !== clampedMidi) {
+        notes[selectedNoteIndex].currentMidi = clampedMidi;
         drawEditor();
       }
       if (e.cancelable) e.preventDefault();
     }
 
-    function handleEnd() {
-      isDragging = false;
-    }
+    function handleEnd() { isDragging = false; }
 
-    // マウスイベント
     canvas.addEventListener('mousedown', handleStart);
     window.addEventListener('mousemove', handleMove);
     window.addEventListener('mouseup', handleEnd);
 
-    // タブレット・スマホ（タッチ）イベント
     canvas.addEventListener('touchstart', handleStart, { passive: false });
     window.addEventListener('touchmove', handleMove, { passive: false });
     window.addEventListener('touchend', handleEnd);
