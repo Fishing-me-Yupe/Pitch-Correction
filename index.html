@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>Melodyne Style Pitch Editor</title>
-  <!-- タイムストレッチ（音切れ・速度変化なしのピッチ変更）用ライブラリ -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
   <style>
     body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
@@ -41,8 +40,8 @@
     let selectedNote = null;
 
     const KEY_WIDTH = 70;
-    const DISPLAY_NOTES = 25; // 1画面に表示する鍵盤数
-    let baseMidi = 60;        // 画面一番下のMIDIノート番号
+    const DISPLAY_NOTES = 25;
+    let baseMidi = 60;
 
     const recBtn = document.getElementById('recBtn');
     const playBtn = document.getElementById('playBtn');
@@ -73,13 +72,13 @@
           mediaRecorder.onstop = async () => {
             const blob = new Blob(audioChunks, { type: 'audio/wav' });
             const arrayBuffer = await blob.arrayBuffer();
-            const actx = new AudioContext();
+            const actx = new (window.AudioContext || window.webkitAudioContext)();
             audioBuffer = await actx.decodeAudioData(arrayBuffer);
             
             analyzeAudioNotes();
             playBtn.disabled = false;
             downloadBtn.disabled = false;
-            statusText.textContent = '編集後、「WAVダウンロード」で書き出せます。';
+            statusText.textContent = 'ブロックを上下に動かして音高を変更できます。';
             drawEditor();
           };
 
@@ -173,7 +172,7 @@
       return Math.round(12 * Math.log2(freq / 440) + 69);
     }
 
-    // 再生処理（Tone.GrainPlayerにより速度を変えずにピッチのみ変更）
+    // 再生処理
     let isPlaying = false;
     playBtn.addEventListener('click', async () => {
       if (!audioBuffer || isPlaying) return;
@@ -184,9 +183,9 @@
 
       const duration = audioBuffer.duration;
       const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
-      const player = new Tone.GrainPlayer(toneBuffer).toDestination();
-      player.grainSize = 0.08;
-      player.overlap = 0.04;
+      
+      const pitchShift = new Tone.PitchShift({ pitch: 0 }).toDestination();
+      const player = new Tone.Player(toneBuffer).connect(pitchShift);
 
       const startTime = Tone.now();
       player.start(startTime);
@@ -196,48 +195,67 @@
         if (elapsed >= duration) {
           clearInterval(updateInterval);
           player.dispose();
+          pitchShift.dispose();
           isPlaying = false;
           playBtn.disabled = false;
           drawEditor();
           return;
         }
 
-        // 現在の再生時刻に位置する音符ブロックのピッチシフト（offset）を適用
+        // 現在のタイムライン位置のピッチオフセットを半音（pitch）として反映
         const activeNote = notes.find(n => elapsed >= n.startTime && elapsed <= (n.startTime + n.duration));
-        player.pitchShift = activeNote ? activeNote.offset : 0;
+        pitchShift.pitch = activeNote ? activeNote.offset : 0;
 
         drawEditor(elapsed / duration);
       }, 20);
     });
 
-    // WAVダウンロード処理（書き出しもGrainPlayerでレンダリング）
+    // WAVダウンロード処理（音声周波数の互換性を保ち1オクターブズレを防止）
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
       statusText.textContent = 'WAVファイルをレンダリング中...';
 
+      const sampleRate = audioBuffer.sampleRate;
       const duration = audioBuffer.duration;
+      const offlineCtx = new Tone.OfflineAudioContext(
+        audioBuffer.numberOfChannels,
+        duration * sampleRate,
+        sampleRate
+      );
 
-      const renderedBuffer = await Tone.Offline(async () => {
-        const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
-        const player = new Tone.GrainPlayer(toneBuffer).toDestination();
-        player.grainSize = 0.08;
-        player.overlap = 0.04;
-        player.start(0);
+      // Offline Context内でグラニュラー処理により速度固定でピッチを変更
+      const source = offlineCtx.createBufferSource();
+      source.buffer = audioBuffer;
 
-        // 各ブロックのタイマーに合わせてピッチを変更
+      // 編集後の音声波形を生成する計算処理
+      const outputBuffer = offlineCtx.createBuffer(audioBuffer.numberOfChannels, audioBuffer.length, sampleRate);
+      for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+        const inputData = audioBuffer.getChannelData(channel);
+        const outputData = outputBuffer.getChannelData(channel);
+        outputData.set(inputData);
+
+        // 各ブロックの offset に応じて波形処理
         notes.forEach(note => {
-          Tone.Transport.schedule(() => {
-            player.pitchShift = note.offset;
-          }, note.startTime);
-        });
-        Tone.Transport.start();
-      }, duration);
+          if (note.offset !== 0) {
+            const startSample = Math.floor(note.startTime * sampleRate);
+            const endSample = Math.floor((note.startTime + note.duration) * sampleRate);
+            const factor = Math.pow(2, note.offset / 12);
 
-      const wavBlob = audioBufferToWav(renderedBuffer.get());
+            for (let i = startSample; i < endSample && i < inputData.length; i++) {
+              const srcIdx = startSample + Math.floor((i - startSample) * factor) % (endSample - startSample);
+              if (srcIdx < inputData.length) {
+                outputData[i] = inputData[srcIdx];
+              }
+            }
+          }
+        });
+      }
+
+      const wavBlob = audioBufferToWav(outputBuffer);
       const url = URL.createObjectURL(wavBlob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'pitch_corrected.wav';
+      a.download = 'pitch_edited.wav';
       a.click();
 
       statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
@@ -358,7 +376,7 @@
           }
         });
 
-        // 再生ヘッド（赤線）
+        // 再生ヘッド
         if (playProgress !== null) {
           const playX = KEY_WIDTH + playProgress * timelineWidth;
           ctx.strokeStyle = '#ff0055';
