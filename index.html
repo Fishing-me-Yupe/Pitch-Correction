@@ -2,26 +2,30 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>Pitch Correction App</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Pitch Corrector</title>
   <style>
-    body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 20px; }
-    .controls { margin-bottom: 20px; }
-    button { padding: 10px 18px; font-size: 14px; margin: 0 5px; cursor: pointer; border: none; border-radius: 4px; background: #007acc; color: white; }
+    body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
+    .controls { margin-bottom: 15px; }
+    button { padding: 12px 20px; font-size: 16px; margin: 5px; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; }
     button:disabled { background: #555; cursor: not-allowed; }
-    #editor { border: 1px solid #444; background: #252526; margin: 0 auto; display: block; cursor: pointer; }
-    .status { margin-top: 10px; color: #aaa; font-size: 14px; }
+    #canvas-container { width: 100%; max-width: 800px; margin: 0 auto; touch-action: none; }
+    #editor { width: 100%; height: 300px; border: 1px solid #444; background: #252526; display: block; cursor: pointer; border-radius: 8px; }
+    .status { margin-top: 12px; color: #aaa; font-size: 14px; }
   </style>
 </head>
 <body>
 
-  <h1>Pitch Corrector (Melodyne Style)</h1>
+  <h1>Pitch Corrector</h1>
   
   <div class="controls">
     <button id="recBtn">録音開始</button>
     <button id="playBtn" disabled>再生</button>
   </div>
 
-  <canvas id="editor" width="800" height="300"></canvas>
+  <div id="canvas-container">
+    <canvas id="editor" width="800" height="300"></canvas>
+  </div>
   <div class="status" id="statusText">録音ボタンを押して声を録音してください。</div>
 
   <script>
@@ -37,7 +41,6 @@
     const ctx = canvas.getContext('2d');
     const statusText = document.getElementById('statusText');
 
-    // 初期のグリッド描画
     drawEditor();
 
     // 録音処理
@@ -47,101 +50,151 @@
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
         recBtn.textContent = '録音開始';
-        statusText.textContent = '録音完了。波形をドラッグしてピッチを変更できます。';
+        statusText.textContent = '録音完了。波形を上下にスワイプ／ドラッグしてピッチを変更できます。';
       } else {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        audioChunks = [];
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream);
+          audioChunks = [];
 
-        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-        mediaRecorder.onstop = async () => {
-          const blob = new Blob(audioChunks, { type: 'audio/wav' });
-          const arrayBuffer = await blob.arrayBuffer();
-          audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-          playBtn.disabled = false;
-          pitchOffset = 0;
-          drawEditor();
-        };
+          mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+          mediaRecorder.onstop = async () => {
+            const blob = new Blob(audioChunks, { type: 'audio/wav' });
+            const arrayBuffer = await blob.arrayBuffer();
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            playBtn.disabled = false;
+            pitchOffset = 0;
+            drawEditor();
+          };
 
-        mediaRecorder.start();
-        recBtn.textContent = '録音停止';
-        statusText.textContent = '録音中...';
+          mediaRecorder.start();
+          recBtn.textContent = '録音停止';
+          statusText.textContent = '録音中...';
+        } catch (err) {
+          statusText.textContent = 'マイクアクセスを許可してください。';
+        }
       }
     });
 
-    // 再生処理（ピッチ変更を反映）
+    // 再生処理
     playBtn.addEventListener('click', () => {
       if (!audioBuffer) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
       
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
-
-      // ピッチ補正（再生速度・周波数変更）
-      // playbackRate = 2 ^ (semitones / 12)
       source.playbackRate.value = Math.pow(2, pitchOffset / 12);
 
       source.connect(audioCtx.destination);
       source.start();
     });
 
-    // エディタ（Canvas）の描画
+    // 実際の音声波形（Waveform）を描画
     function drawEditor() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // ガイド線描画（ノートのライン）
+      // ガイドライン（ピッチ位置）
       ctx.strokeStyle = '#333';
       ctx.lineWidth = 1;
-      for (let y = 0; y < canvas.height; y += 30) {
+      for (let y = 0; y < canvas.height; y += 25) {
         ctx.beginPath();
         ctx.moveTo(0, y);
         ctx.lineTo(canvas.width, y);
         ctx.stroke();
       }
 
-      // 音声データブロック描画
-      if (audioBuffer) {
-        const centerY = canvas.height / 2;
-        const blockY = centerY - (pitchOffset * 15); // 1半音あたり15px移動
+      // ピッチ0の基準線
+      ctx.strokeStyle = '#555';
+      ctx.beginPath();
+      ctx.moveTo(0, canvas.height / 2);
+      ctx.lineTo(canvas.width, canvas.height / 2);
+      ctx.stroke();
 
-        ctx.fillStyle = '#0e80d0';
-        ctx.fillRect(100, blockY - 20, 600, 40);
-        
+      if (audioBuffer) {
+        const data = audioBuffer.getChannelData(0);
+        const step = Math.ceil(data.length / canvas.width);
+        const amp = 45; // 波形の縦幅調整
+        const centerY = (canvas.height / 2) - (pitchOffset * 12); // ピッチ変更で波形全体が上下
+
+        // 波形描画
+        ctx.beginPath();
+        ctx.strokeStyle = '#00bfff';
+        ctx.lineWidth = 1.5;
+
+        for (let i = 0; i < canvas.width; i++) {
+          const sampleIndex = i * step;
+          let min = 1.0;
+          let max = -1.0;
+
+          for (let j = 0; j < step; j++) {
+            const datum = data[sampleIndex + j];
+            if (datum < min) min = datum;
+            if (datum > max) max = datum;
+          }
+
+          const y1 = centerY + (min * amp);
+          const y2 = centerY + (max * amp);
+
+          ctx.moveTo(i, y1);
+          ctx.lineTo(i, y2);
+        }
+        ctx.stroke();
+
+        // ステータス表示
         ctx.fillStyle = '#fff';
-        ctx.font = '14px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(`ピッチ補正: ${pitchOffset > 0 ? '+' : ''}${pitchOffset} 半音`, 400, blockY + 5);
+        ctx.font = 'bold 16px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`ピッチ補正: ${pitchOffset > 0 ? '+' : ''}${pitchOffset} 半音`, 20, 30);
       } else {
         ctx.fillStyle = '#666';
         ctx.font = '16px sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('ここに録音データが表示されます', 400, 150);
+        ctx.fillText('ここに波形が表示されます', canvas.width / 2, canvas.height / 2);
       }
     }
 
-    // ドラッグでピッチ変更
+    // マウス・タッチ操作の共通ハンドラ
     let isDragging = false;
     let startY = 0;
 
-    canvas.addEventListener('mousedown', (e) => {
+    function getPosPointerY(e) {
+      return (e.touches && e.touches.length > 0) ? e.touches[0].clientY : e.clientY;
+    }
+
+    function handleStart(e) {
       if (!audioBuffer) return;
       isDragging = true;
-      startY = e.clientY;
-    });
+      startY = getPosPointerY(e);
+      if (e.cancelable) e.preventDefault();
+    }
 
-    window.addEventListener('mousemove', (e) => {
+    function handleMove(e) {
       if (!isDragging) return;
-      const deltaY = startY - e.clientY;
-      const semitoneChange = Math.round(deltaY / 15);
+      const currentY = getPosPointerY(e);
+      const deltaY = startY - currentY;
+      
+      const semitoneChange = Math.round(deltaY / 12);
       if (semitoneChange !== 0) {
         pitchOffset += semitoneChange;
-        startY = e.clientY;
+        startY = currentY;
         drawEditor();
       }
-    });
+      if (e.cancelable) e.preventDefault();
+    }
 
-    window.addEventListener('mouseup', () => {
+    function handleEnd() {
       isDragging = false;
-    });
+    }
+
+    // マウスイベント
+    canvas.addEventListener('mousedown', handleStart);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleEnd);
+
+    // タブレット・スマホ（タッチ）イベント
+    canvas.addEventListener('touchstart', handleStart, { passive: false });
+    window.addEventListener('touchmove', handleMove, { passive: false });
+    window.addEventListener('touchend', handleEnd);
   </script>
 </body>
 </html>
