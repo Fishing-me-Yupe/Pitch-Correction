@@ -12,6 +12,8 @@
     button:disabled { background: #444; color: #888; cursor: not-allowed; }
     #downloadBtn { background: #28a745; }
     #downloadBtn:disabled { background: #444; }
+    #resetBtn { background: #dc3545; }
+    #resetBtn:disabled { background: #444; }
     #canvas-container { width: 100%; max-width: 900px; margin: 0 auto; touch-action: none; position: relative; }
     #editor { width: 100%; height: 380px; border: 1px solid #444; background: #252526; display: block; border-radius: 6px; }
     .status { margin-top: 10px; color: #aaa; font-size: 14px; }
@@ -24,21 +26,21 @@
   <div class="controls">
     <button id="recBtn">録音開始</button>
     <button id="playBtn" disabled>再生</button>
+    <button id="resetBtn" disabled>ピッチリセット</button>
     <button id="downloadBtn" disabled>WAVダウンロード</button>
   </div>
 
   <div id="canvas-container">
     <canvas id="editor" width="900" height="380"></canvas>
   </div>
-  <div class="status" id="statusText">【1本指】ブロック移動 / 【2本指】画面の音域上下スクロール</div>
+  <div class="status" id="statusText">【1本指ドラッグ】波形の一部を直接上下に変形 / 【2本指】画面の音域スクロール</div>
 
   <script>
     let mediaRecorder;
     let audioChunks = [];
     let audioBuffer = null;
-    let notes = [];
     let pitchCurvePoints = []; // 1秒間に120回の高精度ピッチ・音量データ
-    let selectedNote = null;
+    let rawPitchPoints = []; // リセット用オリジナルデータ
 
     const KEY_WIDTH = 70;
     const DISPLAY_NOTES = 25;
@@ -46,6 +48,7 @@
 
     const recBtn = document.getElementById('recBtn');
     const playBtn = document.getElementById('playBtn');
+    const resetBtn = document.getElementById('resetBtn');
     const downloadBtn = document.getElementById('downloadBtn');
     const canvas = document.getElementById('editor');
     const ctx = canvas.getContext('2d');
@@ -78,8 +81,9 @@
             
             analyzeAudioNotes();
             playBtn.disabled = false;
+            resetBtn.disabled = false;
             downloadBtn.disabled = false;
-            statusText.textContent = 'ブロックを上下に動かして音高を変更できます。';
+            statusText.textContent = '波形の一部分をドラッグして「びよーん」と自由に変形できます。';
             drawEditor();
           };
 
@@ -94,16 +98,14 @@
 
     // 高精細ピッチ＆音量解析（1秒あたり120回サンプリング）
     function analyzeAudioNotes() {
-      notes = [];
       pitchCurvePoints = [];
       if (!audioBuffer) return;
 
       const data = audioBuffer.getChannelData(0);
       const sampleRate = audioBuffer.sampleRate;
       
-      // 120 samples per second -> hopSize
       const samplesPerFrame = Math.floor(sampleRate / 120);
-      const windowSize = Math.floor(sampleRate * 0.04); // 40msの解析ウィンドウ
+      const windowSize = Math.floor(sampleRate * 0.04);
       const totalFrames = Math.floor((data.length - windowSize) / samplesPerFrame);
 
       let detectedMidiss = [];
@@ -112,7 +114,6 @@
         const startSample = i * samplesPerFrame;
         const slice = data.subarray(startSample, startSample + windowSize);
         
-        // 音量 (RMS) の計算
         let sum = 0;
         for (let j = 0; j < slice.length; j++) sum += slice[j] * slice[j];
         let rms = Math.sqrt(sum / slice.length);
@@ -122,6 +123,7 @@
 
         pitchCurvePoints.push({
           time: time,
+          originalMidi: midiFloat,
           midi: midiFloat,
           rms: rms
         });
@@ -131,37 +133,7 @@
         }
       }
 
-      // 連続するピッチフレームからノートブロック（Blobs）を構築
-      let currentNote = null;
-      const chunkSize = samplesPerFrame;
-
-      pitchCurvePoints.forEach((pt, i) => {
-        if (pt.midi !== null) {
-          const roundedMidi = Math.round(pt.midi);
-          if (currentNote && currentNote.midi === roundedMidi) {
-            currentNote.duration += 1 / 120;
-            currentNote.maxRms = Math.max(currentNote.maxRms, pt.rms);
-            currentNote.rmsList.push(pt.rms);
-          } else {
-            if (currentNote) notes.push(currentNote);
-            currentNote = {
-              id: Date.now() + i,
-              startTime: pt.time,
-              duration: 1 / 120,
-              midi: roundedMidi,
-              offset: 0,
-              maxRms: pt.rms,
-              rmsList: [pt.rms]
-            };
-          }
-        } else {
-          if (currentNote) {
-            notes.push(currentNote);
-            currentNote = null;
-          }
-        }
-      });
-      if (currentNote) notes.push(currentNote);
+      rawPitchPoints = JSON.parse(JSON.stringify(pitchCurvePoints));
 
       if (detectedMidiss.length > 0) {
         const avgMidi = Math.round(detectedMidiss.reduce((a, b) => a + b) / detectedMidiss.length);
@@ -201,7 +173,14 @@
       return 12 * Math.log2(freq / 440) + 69;
     }
 
-    // 再生処理
+    // ピッチリセット機能
+    resetBtn.addEventListener('click', () => {
+      pitchCurvePoints = JSON.parse(JSON.stringify(rawPitchPoints));
+      drawEditor();
+      statusText.textContent = 'ピッチカーブを初期状態に戻しました。';
+    });
+
+    // 再生処理（フレームごとに動的なピッチ変化をリアルタイム反映）
     let isPlaying = false;
     playBtn.addEventListener('click', async () => {
       if (!audioBuffer || isPlaying) return;
@@ -231,14 +210,19 @@
           return;
         }
 
-        const activeNote = notes.find(n => elapsed >= n.startTime && elapsed <= (n.startTime + n.duration));
-        pitchShift.pitch = activeNote ? activeNote.offset : 0;
+        // 現在時間における変更後ピッチと元ピッチの差分（半音）をリアルタイム適用
+        const currentPt = pitchCurvePoints.find(p => p.time >= elapsed);
+        if (currentPt && currentPt.midi !== null && currentPt.originalMidi !== null) {
+          pitchShift.pitch = currentPt.midi - currentPt.originalMidi;
+        } else {
+          pitchShift.pitch = 0;
+        }
 
         drawEditor(elapsed / duration);
-      }, 20);
+      }, 10);
     });
 
-    // WAVダウンロード処理
+    // WAVダウンロード処理（滑らかに変更されたピッチカーブを直接反映）
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
       statusText.textContent = 'WAVファイルをレンダリング中...';
@@ -252,32 +236,40 @@
       );
 
       const outputBuffer = offlineCtx.createBuffer(audioBuffer.numberOfChannels, audioBuffer.length, sampleRate);
+      
       for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
         const inputData = audioBuffer.getChannelData(channel);
         const outputData = outputBuffer.getChannelData(channel);
-        outputData.set(inputData);
 
-        notes.forEach(note => {
-          if (note.offset !== 0) {
-            const startSample = Math.floor(note.startTime * sampleRate);
-            const endSample = Math.floor((note.startTime + note.duration) * sampleRate);
-            const factor = Math.pow(2, note.offset / 12);
-
-            for (let i = startSample; i < endSample && i < inputData.length; i++) {
-              const srcIdx = startSample + Math.floor((i - startSample) * factor) % (endSample - startSample);
-              if (srcIdx < inputData.length) {
-                outputData[i] = inputData[srcIdx];
-              }
-            }
+        let currentFrameIdx = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          const time = i / sampleRate;
+          while (currentFrameIdx < pitchCurvePoints.length - 1 && pitchCurvePoints[currentFrameIdx + 1].time <= time) {
+            currentFrameIdx++;
           }
-        });
+          
+          const pt = pitchCurvePoints[currentFrameIdx];
+          let semitoneShift = 0;
+          if (pt && pt.midi !== null && pt.originalMidi !== null) {
+            semitoneShift = pt.midi - pt.originalMidi;
+          }
+
+          if (semitoneShift === 0) {
+            outputData[i] = inputData[i];
+          } else {
+            // ピッチ変更に伴う波形のリサンプリング
+            const factor = Math.pow(2, semitoneShift / 12);
+            const srcIdx = Math.floor(i * factor) % inputData.length;
+            outputData[i] = inputData[srcIdx];
+          }
+        }
       }
 
       const wavBlob = audioBufferToWav(outputBuffer);
       const url = URL.createObjectURL(wavBlob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'pitch_edited.wav';
+      a.download = 'pitch_deformed.wav';
       a.click();
 
       statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
@@ -325,13 +317,13 @@
       return new Blob([view.buffer], { type: 'audio/wav' });
     }
 
-    // 画面描画（Melodyneスタイルの波形・ピッチ曲線表示）
+    // 画面描画
     function drawEditor(playProgress = null) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const noteHeight = canvas.height / DISPLAY_NOTES;
       const maxMidi = baseMidi + DISPLAY_NOTES - 1;
 
-      // 背景グリッド描画
+      // グリッド描画
       for (let i = 0; i < DISPLAY_NOTES; i++) {
         const midi = maxMidi - i;
         const y = i * noteHeight;
@@ -347,7 +339,7 @@
         ctx.stroke();
       }
 
-      // 鍵盤部描画
+      // 鍵盤描画
       for (let i = 0; i < DISPLAY_NOTES; i++) {
         const midi = maxMidi - i;
         const y = i * noteHeight;
@@ -369,81 +361,70 @@
         }
       }
 
-      if (audioBuffer && notes.length > 0) {
+      if (audioBuffer && pitchCurvePoints.length > 0) {
         const totalDuration = audioBuffer.duration;
         const timelineWidth = canvas.width - KEY_WIDTH;
 
-        // 1. 音量に応じたMelodyne Blob（立体感のある楕円ブロック）の描画
-        notes.forEach(note => {
-          const currentMidi = note.midi + note.offset;
-          
-          if (currentMidi >= baseMidi && currentMidi <= maxMidi) {
-            const yIndex = maxMidi - currentMidi;
-            const yCenter = yIndex * noteHeight + noteHeight / 2;
-            const x = KEY_WIDTH + (note.startTime / totalDuration) * timelineWidth;
-            const w = (note.duration / totalDuration) * timelineWidth;
+        // 1. 音量振幅ボディ（Blob）の描画
+        let maxRmsGlobal = Math.max(...pitchCurvePoints.map(p => p.rms)) || 0.01;
+        ctx.fillStyle = 'rgba(211, 84, 0, 0.45)';
+        ctx.strokeStyle = 'rgba(243, 156, 18, 0.8)';
+        ctx.lineWidth = 1.5;
 
-            note.renderX = x;
-            note.renderY = yIndex * noteHeight;
-            note.renderW = w;
-            note.renderH = noteHeight;
+        ctx.beginPath();
+        let isTopDrawing = false;
+        
+        // 上側の輪郭
+        pitchCurvePoints.forEach(pt => {
+          if (pt.midi !== null) {
+            const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
+            const py = (maxMidi - pt.midi) * noteHeight + noteHeight / 2;
+            const ampHeight = (pt.rms / maxRmsGlobal) * noteHeight * 0.95;
 
-            // 各フレームごとの音量振幅（心電図的Waveform/Blob形状）を描画
-            ctx.fillStyle = (note.offset !== 0) ? '#e67e22' : '#d35400';
-            ctx.strokeStyle = '#f39c12';
-            ctx.lineWidth = 1;
-
-            ctx.beginPath();
-            const step = Math.max(1, Math.floor(note.rmsList.length / 20));
-            for (let i = 0; i < note.rmsList.length; i += step) {
-              const px = x + (i / note.rmsList.length) * w;
-              const ampHeight = Math.min(noteHeight * 0.9, (note.rmsList[i] / (note.maxRms || 0.01)) * noteHeight * 0.8);
-              if (i === 0) ctx.moveTo(px, yCenter - ampHeight / 2);
-              else ctx.lineTo(px, yCenter - ampHeight / 2);
+            if (!isTopDrawing) {
+              ctx.moveTo(px, py - ampHeight / 2);
+              isTopDrawing = true;
+            } else {
+              ctx.lineTo(px, py - ampHeight / 2);
             }
-            for (let i = note.rmsList.length - 1; i >= 0; i -= step) {
-              const px = x + (i / note.rmsList.length) * w;
-              const ampHeight = Math.min(noteHeight * 0.9, (note.rmsList[i] / (note.maxRms || 0.01)) * noteHeight * 0.8);
-              ctx.lineTo(px, yCenter + ampHeight / 2);
-            }
-            ctx.closePath();
-            ctx.fill();
-            ctx.stroke();
-
-            // 音名表示
-            ctx.fillStyle = '#fff';
-            ctx.font = 'bold 10px sans-serif';
-            ctx.textAlign = 'left';
-            const name = noteNames[currentMidi % 12];
-            if (w > 15) ctx.fillText(name, x + 4, yCenter + 3);
           } else {
-            note.renderX = -999;
+            isTopDrawing = false;
           }
         });
 
-        // 2. 赤色の心電図的ピッチ曲線の連続描画
+        // 下側の輪郭
+        for (let i = pitchCurvePoints.length - 1; i >= 0; i--) {
+          const pt = pitchCurvePoints[i];
+          if (pt.midi !== null) {
+            const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
+            const py = (maxMidi - pt.midi) * noteHeight + noteHeight / 2;
+            const ampHeight = (pt.rms / maxRmsGlobal) * noteHeight * 0.95;
+            ctx.lineTo(px, py + ampHeight / 2);
+          }
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+
+        // 2. 赤色/黄色の心電図ピッチ波形の描画（変形が「びよーん」と見えるように描画）
         ctx.strokeStyle = '#ff3366';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = 3;
         ctx.beginPath();
-        let isDrawingPath = false;
+        let isCurveDrawing = false;
 
         pitchCurvePoints.forEach(pt => {
           if (pt.midi !== null) {
-            // 現在の時間が所属するノートのオフセットを適用
-            const parentNote = notes.find(n => pt.time >= n.startTime && pt.time <= (n.startTime + n.duration));
-            const shiftedMidi = pt.midi + (parentNote ? parentNote.offset : 0);
-
             const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
-            const py = (maxMidi - shiftedMidi) * noteHeight + noteHeight / 2;
+            const py = (maxMidi - pt.midi) * noteHeight + noteHeight / 2;
 
-            if (!isDrawingPath) {
+            if (!isCurveDrawing) {
               ctx.moveTo(px, py);
-              isDrawingPath = true;
+              isCurveDrawing = true;
             } else {
               ctx.lineTo(px, py);
             }
           } else {
-            isDrawingPath = false;
+            isCurveDrawing = false;
           }
         });
         ctx.stroke();
@@ -463,13 +444,14 @@
         ctx.fillStyle = '#666';
         ctx.font = '15px sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('ここに音階ブロックとピッチ波形が表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
+        ctx.fillText('ここに波形とピッチカーブが表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
       }
     }
 
-    // タッチ＆マウス操作ハンドラ
+    // 「びよーん」と滑らかにピッチを変形（Deform）させるインタラクション
     let isDragging = false;
     let isTwoFingerScroll = false;
+    let dragCenterIdx = -1;
     let startY = 0;
     let twoFingerStartY = 0;
 
@@ -489,22 +471,36 @@
       if (e.touches && e.touches.length === 2) {
         isTwoFingerScroll = true;
         isDragging = false;
-        selectedNote = null;
         twoFingerStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
         if (e.cancelable) e.preventDefault();
         return;
       }
 
       const pos = getCanvasCoords(e);
-      if (pos.x < KEY_WIDTH) return;
+      if (pos.x < KEY_WIDTH || !audioBuffer || pitchCurvePoints.length === 0) return;
 
-      selectedNote = notes.find(n => 
-        pos.x >= n.renderX && pos.x <= n.renderX + n.renderW
-      );
+      const totalDuration = audioBuffer.duration;
+      const timelineWidth = canvas.width - KEY_WIDTH;
+      const clickedTime = ((pos.x - KEY_WIDTH) / timelineWidth) * totalDuration;
 
-      if (selectedNote) {
+      // クリック位置に最も近いピッチサンプリング点を検索
+      let closestIdx = -1;
+      let minDistance = Infinity;
+
+      pitchCurvePoints.forEach((pt, idx) => {
+        if (pt.midi !== null) {
+          const dist = Math.abs(pt.time - clickedTime);
+          if (dist < minDistance) {
+            minDistance = dist;
+            closestIdx = idx;
+          }
+        }
+      });
+
+      if (closestIdx !== -1 && minDistance < 0.25) { // 近くに波形が存在する場合
         isDragging = true;
         isTwoFingerScroll = false;
+        dragCenterIdx = closestIdx;
         startY = pos.y;
         if (e.cancelable) e.preventDefault();
       }
@@ -526,15 +522,30 @@
         return;
       }
 
-      if (isDragging && selectedNote) {
+      if (isDragging && dragCenterIdx !== -1) {
         const pos = getCanvasCoords(e);
         const noteHeight = canvas.height / DISPLAY_NOTES;
         
+        // 移動量をMIDI（ピッチ）の変化量に変換
         const deltaY = startY - pos.y;
-        const semitoneShift = Math.round(deltaY / noteHeight);
+        const midiDelta = deltaY / noteHeight;
 
-        if (semitoneShift !== 0) {
-          selectedNote.offset += semitoneShift;
+        if (Math.abs(midiDelta) > 0.01) {
+          // 選択位置周辺（影響範囲）のピッチをガウス関数的に「びよーん」と連続変形
+          const influenceRadius = 18; // 変形の影響を及ぼすフレーム幅（約15フレーム = 約0.12秒間）
+
+          for (let i = -influenceRadius; i <= influenceRadius; i++) {
+            const targetIdx = dragCenterIdx + i;
+            if (targetIdx >= 0 && targetIdx < pitchCurvePoints.length) {
+              const pt = pitchCurvePoints[targetIdx];
+              if (pt.midi !== null) {
+                // ガウス鐘型曲線による滑らかな引き伸ばし補間
+                const factor = Math.exp(-Math.pow(i / (influenceRadius / 2), 2));
+                pt.midi += midiDelta * factor;
+              }
+            }
+          }
+
           startY = pos.y;
           drawEditor();
         }
@@ -546,7 +557,7 @@
       if (!e.touches || e.touches.length === 0) {
         isDragging = false;
         isTwoFingerScroll = false;
-        selectedNote = null;
+        dragCenterIdx = -1;
       } else if (e.touches && e.touches.length === 1) {
         isTwoFingerScroll = false;
       }
