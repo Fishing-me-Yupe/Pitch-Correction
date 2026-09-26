@@ -39,7 +39,7 @@
     let mediaRecorder;
     let audioChunks = [];
     let audioBuffer = null;
-    let pitchCurvePoints = []; // 1秒間に120回の高精度ピッチ・音量データ
+    let pitchCurvePoints = []; // 1秒間に120回の高精度ピッチデータ
     let rawPitchPoints = []; // リセット用オリジナルデータ
 
     const KEY_WIDTH = 70;
@@ -96,7 +96,7 @@
       }
     });
 
-    // 高精細ピッチ＆音量解析（1秒あたり120回サンプリング）
+    // 高精細ピッチ解析（1秒あたり120回サンプリング）
     function analyzeAudioNotes() {
       pitchCurvePoints = [];
       if (!audioBuffer) return;
@@ -114,18 +114,13 @@
         const startSample = i * samplesPerFrame;
         const slice = data.subarray(startSample, startSample + windowSize);
         
-        let sum = 0;
-        for (let j = 0; j < slice.length; j++) sum += slice[j] * slice[j];
-        let rms = Math.sqrt(sum / slice.length);
-
         const midiFloat = detectPitchMIDIFloat(slice, sampleRate);
         const time = startSample / sampleRate;
 
         pitchCurvePoints.push({
           time: time,
           originalMidi: midiFloat,
-          midi: midiFloat,
-          rms: rms
+          midi: midiFloat
         });
 
         if (midiFloat !== null) {
@@ -180,7 +175,7 @@
       statusText.textContent = 'ピッチカーブを初期状態に戻しました。';
     });
 
-    // 再生処理（フレームごとに動的なピッチ変化をリアルタイム反映）
+    // 再生処理
     let isPlaying = false;
     playBtn.addEventListener('click', async () => {
       if (!audioBuffer || isPlaying) return;
@@ -210,7 +205,6 @@
           return;
         }
 
-        // 現在時間における変更後ピッチと元ピッチの差分（半音）をリアルタイム適用
         const currentPt = pitchCurvePoints.find(p => p.time >= elapsed);
         if (currentPt && currentPt.midi !== null && currentPt.originalMidi !== null) {
           pitchShift.pitch = currentPt.midi - currentPt.originalMidi;
@@ -222,68 +216,77 @@
       }, 10);
     });
 
-    // WAVダウンロード処理（滑らかに変更されたピッチカーブを直接反映）
+    // 修正版：WAVダウンロード処理（レンダリングアルゴリズムの高速化・確実化）
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
-      statusText.textContent = 'WAVファイルをレンダリング中...';
+      statusText.textContent = 'WAVファイルを生成中...';
 
-      const sampleRate = audioBuffer.sampleRate;
-      const duration = audioBuffer.duration;
-      const offlineCtx = new Tone.OfflineAudioContext(
-        audioBuffer.numberOfChannels,
-        duration * sampleRate,
-        sampleRate
-      );
+      try {
+        const sampleRate = audioBuffer.sampleRate;
+        const numChannels = audioBuffer.numberOfChannels;
+        const length = audioBuffer.length;
+        
+        // メモリ上で直接書き換えたオーディオバッファを生成
+        const actx = new (window.AudioContext || window.webkitAudioContext)();
+        const outBuffer = actx.createBuffer(numChannels, length, sampleRate);
 
-      const outputBuffer = offlineCtx.createBuffer(audioBuffer.numberOfChannels, audioBuffer.length, sampleRate);
-      
-      for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
-        const inputData = audioBuffer.getChannelData(channel);
-        const outputData = outputBuffer.getChannelData(channel);
-
-        let currentFrameIdx = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          const time = i / sampleRate;
-          while (currentFrameIdx < pitchCurvePoints.length - 1 && pitchCurvePoints[currentFrameIdx + 1].time <= time) {
-            currentFrameIdx++;
-          }
+        for (let ch = 0; ch < numChannels; ch++) {
+          const inputData = audioBuffer.getChannelData(ch);
+          const outputData = outBuffer.getChannelData(ch);
           
-          const pt = pitchCurvePoints[currentFrameIdx];
-          let semitoneShift = 0;
-          if (pt && pt.midi !== null && pt.originalMidi !== null) {
-            semitoneShift = pt.midi - pt.originalMidi;
-          }
+          let readPos = 0;
+          for (let i = 0; i < length; i++) {
+            const time = i / sampleRate;
+            
+            // 現在のフレーム位置を検索
+            const frameIdx = Math.min(
+              pitchCurvePoints.length - 1,
+              Math.floor(time * 120)
+            );
+            const pt = pitchCurvePoints[frameIdx];
 
-          if (semitoneShift === 0) {
-            outputData[i] = inputData[i];
-          } else {
-            // ピッチ変更に伴う波形のリサンプリング
-            const factor = Math.pow(2, semitoneShift / 12);
-            const srcIdx = Math.floor(i * factor) % inputData.length;
+            let shift = 0;
+            if (pt && pt.midi !== null && pt.originalMidi !== null) {
+              shift = pt.midi - pt.originalMidi;
+            }
+
+            const speed = Math.pow(2, shift / 12);
+            readPos += speed;
+            
+            const srcIdx = Math.floor(readPos) % length;
             outputData[i] = inputData[srcIdx];
           }
         }
+
+        const wavBlob = audioBufferToWav(outBuffer);
+        const url = URL.createObjectURL(wavBlob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = 'pitch_edited.wav';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }, 100);
+
+        statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
+      } catch (err) {
+        console.error(err);
+        statusText.textContent = 'ダウンロード中にエラーが発生しました。';
       }
-
-      const wavBlob = audioBufferToWav(outputBuffer);
-      const url = URL.createObjectURL(wavBlob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'pitch_deformed.wav';
-      a.click();
-
-      statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
     });
 
     function audioBufferToWav(buffer) {
       const numOfChan = buffer.numberOfChannels;
       const sampleRate = buffer.sampleRate;
-      const format = 1;
+      const format = 1; // PCM
       const bitDepth = 16;
       
       let samples = buffer.getChannelData(0);
-      let length = samples.length * 2 + 44;
-      let bufferArray = new ArrayBuffer(length);
+      let dataLength = samples.length * 2;
+      let bufferArray = new ArrayBuffer(44 + dataLength);
       let view = new DataView(bufferArray);
 
       let pos = 0;
@@ -294,7 +297,7 @@
       }
 
       writeString('RIFF');
-      view.setUint32(pos, length - 8, true); pos += 4;
+      view.setUint32(pos, 36 + dataLength, true); pos += 4;
       writeString('WAVE');
 
       writeString('fmt ');
@@ -307,17 +310,17 @@
       view.setUint16(pos, bitDepth, true); pos += 2;
 
       writeString('data');
-      view.setUint32(pos, length - pos - 4, true); pos += 4;
+      view.setUint32(pos, dataLength, true); pos += 4;
 
       for (let i = 0; i < samples.length; i++, pos += 2) {
         let s = Math.max(-1, Math.min(1, samples[i]));
         view.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       }
 
-      return new Blob([view.buffer], { type: 'audio/wav' });
+      return new Blob([view], { type: 'audio/wav' });
     }
 
-    // 画面描画
+    // 画面描画（薄いオレンジの立体図形を排除し、赤線ピッチ曲線のみ表示）
     function drawEditor(playProgress = null) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const noteHeight = canvas.height / DISPLAY_NOTES;
@@ -365,48 +368,7 @@
         const totalDuration = audioBuffer.duration;
         const timelineWidth = canvas.width - KEY_WIDTH;
 
-        // 1. 音量振幅ボディ（Blob）の描画
-        let maxRmsGlobal = Math.max(...pitchCurvePoints.map(p => p.rms)) || 0.01;
-        ctx.fillStyle = 'rgba(211, 84, 0, 0.45)';
-        ctx.strokeStyle = 'rgba(243, 156, 18, 0.8)';
-        ctx.lineWidth = 1.5;
-
-        ctx.beginPath();
-        let isTopDrawing = false;
-        
-        // 上側の輪郭
-        pitchCurvePoints.forEach(pt => {
-          if (pt.midi !== null) {
-            const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
-            const py = (maxMidi - pt.midi) * noteHeight + noteHeight / 2;
-            const ampHeight = (pt.rms / maxRmsGlobal) * noteHeight * 0.95;
-
-            if (!isTopDrawing) {
-              ctx.moveTo(px, py - ampHeight / 2);
-              isTopDrawing = true;
-            } else {
-              ctx.lineTo(px, py - ampHeight / 2);
-            }
-          } else {
-            isTopDrawing = false;
-          }
-        });
-
-        // 下側の輪郭
-        for (let i = pitchCurvePoints.length - 1; i >= 0; i--) {
-          const pt = pitchCurvePoints[i];
-          if (pt.midi !== null) {
-            const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
-            const py = (maxMidi - pt.midi) * noteHeight + noteHeight / 2;
-            const ampHeight = (pt.rms / maxRmsGlobal) * noteHeight * 0.95;
-            ctx.lineTo(px, py + ampHeight / 2);
-          }
-        }
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-
-        // 2. 赤色/黄色の心電図ピッチ波形の描画（変形が「びよーん」と見えるように描画）
+        // 赤色/心電図ピッチ波形の描画
         ctx.strokeStyle = '#ff3366';
         ctx.lineWidth = 3;
         ctx.beginPath();
@@ -448,7 +410,7 @@
       }
     }
 
-    // 「びよーん」と滑らかにピッチを変形（Deform）させるインタラクション
+    // 変形（Deform）インタラクション
     let isDragging = false;
     let isTwoFingerScroll = false;
     let dragCenterIdx = -1;
@@ -483,7 +445,6 @@
       const timelineWidth = canvas.width - KEY_WIDTH;
       const clickedTime = ((pos.x - KEY_WIDTH) / timelineWidth) * totalDuration;
 
-      // クリック位置に最も近いピッチサンプリング点を検索
       let closestIdx = -1;
       let minDistance = Infinity;
 
@@ -497,7 +458,7 @@
         }
       });
 
-      if (closestIdx !== -1 && minDistance < 0.25) { // 近くに波形が存在する場合
+      if (closestIdx !== -1 && minDistance < 0.25) {
         isDragging = true;
         isTwoFingerScroll = false;
         dragCenterIdx = closestIdx;
@@ -526,20 +487,17 @@
         const pos = getCanvasCoords(e);
         const noteHeight = canvas.height / DISPLAY_NOTES;
         
-        // 移動量をMIDI（ピッチ）の変化量に変換
         const deltaY = startY - pos.y;
         const midiDelta = deltaY / noteHeight;
 
         if (Math.abs(midiDelta) > 0.01) {
-          // 選択位置周辺（影響範囲）のピッチをガウス関数的に「びよーん」と連続変形
-          const influenceRadius = 18; // 変形の影響を及ぼすフレーム幅（約15フレーム = 約0.12秒間）
+          const influenceRadius = 18;
 
           for (let i = -influenceRadius; i <= influenceRadius; i++) {
             const targetIdx = dragCenterIdx + i;
             if (targetIdx >= 0 && targetIdx < pitchCurvePoints.length) {
               const pt = pitchCurvePoints[targetIdx];
               if (pt.midi !== null) {
-                // ガウス鐘型曲線による滑らかな引き伸ばし補間
                 const factor = Math.exp(-Math.pow(i / (influenceRadius / 2), 2));
                 pt.midi += midiDelta * factor;
               }
