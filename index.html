@@ -37,6 +37,7 @@
     let audioChunks = [];
     let audioBuffer = null;
     let notes = [];
+    let pitchCurvePoints = []; // 1秒間に120回の高精度ピッチ・音量データ
     let selectedNote = null;
 
     const KEY_WIDTH = 70;
@@ -91,39 +92,66 @@
       }
     });
 
-    // ピッチ検出
+    // 高精細ピッチ＆音量解析（1秒あたり120回サンプリング）
     function analyzeAudioNotes() {
       notes = [];
+      pitchCurvePoints = [];
       if (!audioBuffer) return;
 
       const data = audioBuffer.getChannelData(0);
       const sampleRate = audioBuffer.sampleRate;
-      const chunkSize = Math.floor(sampleRate * 0.1);
-      const totalChunks = Math.floor(data.length / chunkSize);
+      
+      // 120 samples per second -> hopSize
+      const samplesPerFrame = Math.floor(sampleRate / 120);
+      const windowSize = Math.floor(sampleRate * 0.04); // 40msの解析ウィンドウ
+      const totalFrames = Math.floor((data.length - windowSize) / samplesPerFrame);
 
-      let currentNote = null;
       let detectedMidiss = [];
 
-      for (let i = 0; i < totalChunks; i++) {
-        const startSample = i * chunkSize;
-        const slice = data.subarray(startSample, startSample + chunkSize);
-        const midi = detectPitchMIDI(slice, sampleRate);
+      for (let i = 0; i < totalFrames; i++) {
+        const startSample = i * samplesPerFrame;
+        const slice = data.subarray(startSample, startSample + windowSize);
+        
+        // 音量 (RMS) の計算
+        let sum = 0;
+        for (let j = 0; j < slice.length; j++) sum += slice[j] * slice[j];
+        let rms = Math.sqrt(sum / slice.length);
 
-        if (midi !== null) {
-          detectedMidiss.push(midi);
-          if (currentNote && currentNote.midi === midi) {
-            currentNote.lengthSamples += chunkSize;
-            currentNote.duration += 0.1;
+        const midiFloat = detectPitchMIDIFloat(slice, sampleRate);
+        const time = startSample / sampleRate;
+
+        pitchCurvePoints.push({
+          time: time,
+          midi: midiFloat,
+          rms: rms
+        });
+
+        if (midiFloat !== null) {
+          detectedMidiss.push(midiFloat);
+        }
+      }
+
+      // 連続するピッチフレームからノートブロック（Blobs）を構築
+      let currentNote = null;
+      const chunkSize = samplesPerFrame;
+
+      pitchCurvePoints.forEach((pt, i) => {
+        if (pt.midi !== null) {
+          const roundedMidi = Math.round(pt.midi);
+          if (currentNote && currentNote.midi === roundedMidi) {
+            currentNote.duration += 1 / 120;
+            currentNote.maxRms = Math.max(currentNote.maxRms, pt.rms);
+            currentNote.rmsList.push(pt.rms);
           } else {
             if (currentNote) notes.push(currentNote);
             currentNote = {
               id: Date.now() + i,
-              startSample: startSample,
-              lengthSamples: chunkSize,
-              startTime: i * 0.1,
-              duration: 0.1,
-              midi: midi,
-              offset: 0
+              startTime: pt.time,
+              duration: 1 / 120,
+              midi: roundedMidi,
+              offset: 0,
+              maxRms: pt.rms,
+              rmsList: [pt.rms]
             };
           }
         } else {
@@ -132,7 +160,7 @@
             currentNote = null;
           }
         }
-      }
+      });
       if (currentNote) notes.push(currentNote);
 
       if (detectedMidiss.length > 0) {
@@ -141,11 +169,12 @@
       }
     }
 
-    function detectPitchMIDI(buffer, sampleRate) {
+    // 連続的な周波数（MIDI小数値）の検出
+    function detectPitchMIDIFloat(buffer, sampleRate) {
       let sum = 0;
       for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
       let rms = Math.sqrt(sum / buffer.length);
-      if (rms < 0.02) return null;
+      if (rms < 0.015) return null;
 
       let r1 = 0, r2 = buffer.length - 1, thres = 0.2;
       for (let i = 0; i < buffer.length / 2; i++) if (Math.abs(buffer[i]) < thres) { r1 = i; break; }
@@ -169,7 +198,7 @@
       let freq = sampleRate / maxpos;
       if (freq < 80 || freq > 1200) return null;
 
-      return Math.round(12 * Math.log2(freq / 440) + 69);
+      return 12 * Math.log2(freq / 440) + 69;
     }
 
     // 再生処理
@@ -202,7 +231,6 @@
           return;
         }
 
-        // 現在のタイムライン位置のピッチオフセットを半音（pitch）として反映
         const activeNote = notes.find(n => elapsed >= n.startTime && elapsed <= (n.startTime + n.duration));
         pitchShift.pitch = activeNote ? activeNote.offset : 0;
 
@@ -210,7 +238,7 @@
       }, 20);
     });
 
-    // WAVダウンロード処理（音声周波数の互換性を保ち1オクターブズレを防止）
+    // WAVダウンロード処理
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
       statusText.textContent = 'WAVファイルをレンダリング中...';
@@ -223,18 +251,12 @@
         sampleRate
       );
 
-      // Offline Context内でグラニュラー処理により速度固定でピッチを変更
-      const source = offlineCtx.createBufferSource();
-      source.buffer = audioBuffer;
-
-      // 編集後の音声波形を生成する計算処理
       const outputBuffer = offlineCtx.createBuffer(audioBuffer.numberOfChannels, audioBuffer.length, sampleRate);
       for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
         const inputData = audioBuffer.getChannelData(channel);
         const outputData = outputBuffer.getChannelData(channel);
         outputData.set(inputData);
 
-        // 各ブロックの offset に応じて波形処理
         notes.forEach(note => {
           if (note.offset !== 0) {
             const startSample = Math.floor(note.startTime * sampleRate);
@@ -303,12 +325,13 @@
       return new Blob([view.buffer], { type: 'audio/wav' });
     }
 
-    // 画面描画
+    // 画面描画（Melodyneスタイルの波形・ピッチ曲線表示）
     function drawEditor(playProgress = null) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const noteHeight = canvas.height / DISPLAY_NOTES;
       const maxMidi = baseMidi + DISPLAY_NOTES - 1;
 
+      // 背景グリッド描画
       for (let i = 0; i < DISPLAY_NOTES; i++) {
         const midi = maxMidi - i;
         const y = i * noteHeight;
@@ -324,6 +347,7 @@
         ctx.stroke();
       }
 
+      // 鍵盤部描画
       for (let i = 0; i < DISPLAY_NOTES; i++) {
         const midi = maxMidi - i;
         const y = i * noteHeight;
@@ -349,37 +373,85 @@
         const totalDuration = audioBuffer.duration;
         const timelineWidth = canvas.width - KEY_WIDTH;
 
+        // 1. 音量に応じたMelodyne Blob（立体感のある楕円ブロック）の描画
         notes.forEach(note => {
           const currentMidi = note.midi + note.offset;
           
           if (currentMidi >= baseMidi && currentMidi <= maxMidi) {
             const yIndex = maxMidi - currentMidi;
-            const y = yIndex * noteHeight;
+            const yCenter = yIndex * noteHeight + noteHeight / 2;
             const x = KEY_WIDTH + (note.startTime / totalDuration) * timelineWidth;
             const w = (note.duration / totalDuration) * timelineWidth;
 
             note.renderX = x;
-            note.renderY = y;
+            note.renderY = yIndex * noteHeight;
             note.renderW = w;
             note.renderH = noteHeight;
 
-            ctx.fillStyle = (note.offset !== 0) ? '#ff9500' : '#00bfff';
-            ctx.fillRect(x + 1, y + 1, Math.max(w - 2, 4), noteHeight - 2);
+            // 各フレームごとの音量振幅（心電図的Waveform/Blob形状）を描画
+            ctx.fillStyle = (note.offset !== 0) ? '#e67e22' : '#d35400';
+            ctx.strokeStyle = '#f39c12';
+            ctx.lineWidth = 1;
 
+            ctx.beginPath();
+            const step = Math.max(1, Math.floor(note.rmsList.length / 20));
+            for (let i = 0; i < note.rmsList.length; i += step) {
+              const px = x + (i / note.rmsList.length) * w;
+              const ampHeight = Math.min(noteHeight * 0.9, (note.rmsList[i] / (note.maxRms || 0.01)) * noteHeight * 0.8);
+              if (i === 0) ctx.moveTo(px, yCenter - ampHeight / 2);
+              else ctx.lineTo(px, yCenter - ampHeight / 2);
+            }
+            for (let i = note.rmsList.length - 1; i >= 0; i -= step) {
+              const px = x + (i / note.rmsList.length) * w;
+              const ampHeight = Math.min(noteHeight * 0.9, (note.rmsList[i] / (note.maxRms || 0.01)) * noteHeight * 0.8);
+              ctx.lineTo(px, yCenter + ampHeight / 2);
+            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            // 音名表示
             ctx.fillStyle = '#fff';
-            ctx.font = 'bold 11px sans-serif';
+            ctx.font = 'bold 10px sans-serif';
             ctx.textAlign = 'left';
             const name = noteNames[currentMidi % 12];
-            if (w > 20) ctx.fillText(name, x + 4, y + noteHeight - 3);
+            if (w > 15) ctx.fillText(name, x + 4, yCenter + 3);
           } else {
             note.renderX = -999;
           }
         });
 
+        // 2. 赤色の心電図的ピッチ曲線の連続描画
+        ctx.strokeStyle = '#ff3366';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        let isDrawingPath = false;
+
+        pitchCurvePoints.forEach(pt => {
+          if (pt.midi !== null) {
+            // 現在の時間が所属するノートのオフセットを適用
+            const parentNote = notes.find(n => pt.time >= n.startTime && pt.time <= (n.startTime + n.duration));
+            const shiftedMidi = pt.midi + (parentNote ? parentNote.offset : 0);
+
+            const px = KEY_WIDTH + (pt.time / totalDuration) * timelineWidth;
+            const py = (maxMidi - shiftedMidi) * noteHeight + noteHeight / 2;
+
+            if (!isDrawingPath) {
+              ctx.moveTo(px, py);
+              isDrawingPath = true;
+            } else {
+              ctx.lineTo(px, py);
+            }
+          } else {
+            isDrawingPath = false;
+          }
+        });
+        ctx.stroke();
+
         // 再生ヘッド
         if (playProgress !== null) {
           const playX = KEY_WIDTH + playProgress * timelineWidth;
-          ctx.strokeStyle = '#ff0055';
+          ctx.strokeStyle = '#00ffff';
           ctx.lineWidth = 2;
           ctx.beginPath();
           ctx.moveTo(playX, 0);
@@ -391,7 +463,7 @@
         ctx.fillStyle = '#666';
         ctx.font = '15px sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText('ここに音階ブロックが表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
+        ctx.fillText('ここに音階ブロックとピッチ波形が表示されます', (canvas.width + KEY_WIDTH) / 2, canvas.height / 2);
       }
     }
 
