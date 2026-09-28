@@ -26,8 +26,9 @@
   
   <div class="controls">
     <button id="recBtn">録音開始</button>
-    <label class="btn" for="fileInput">音声ファイル読み込み</label>
-    <input type="file" id="fileInput" accept="audio/*">
+    <label class="btn" for="fileInput">音声/動画ファイル読み込み</label>
+    <!-- 音声・動画ファイルを一括許可 -->
+    <input type="file" id="fileInput" accept="audio/*,video/*,video/mp4,.wav,.mp3,.mp4,.mov,.webm">
     <button id="playBtn" disabled>再生</button>
     <button id="resetBtn" disabled>ピッチリセット</button>
     <button id="downloadBtn" disabled>WAVダウンロード</button>
@@ -62,29 +63,31 @@
 
     drawEditor();
 
-    // 1. 音声ファイルの読み込み処理（MP3 / WAV / AAC 等）
+    // 1. 音声・動画ファイル読み込み処理（MP4, MOV, WAV, MP3等に完全対応）
     fileInput.addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
 
-      statusText.textContent = 'ファイルを解析中...';
-      const arrayBuffer = await file.arrayBuffer();
-      const actx = new (window.AudioContext || window.webkitAudioContext)();
-      
+      statusText.textContent = 'メディアファイルを解析中...';
       try {
+        const arrayBuffer = await file.arrayBuffer();
+        const actx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        // 動画ファイルであっても音声トラックを自動抽出してデコード
         audioBuffer = await actx.decodeAudioData(arrayBuffer);
         analyzeAudioNotes();
         playBtn.disabled = false;
         resetBtn.disabled = false;
         downloadBtn.disabled = false;
-        statusText.textContent = 'ファイルの読み込み完了。ピッチカーブを自由に編集できます。';
+        statusText.textContent = 'ファイルの読み込み完了。ピッチカーブを「びよーん」と変形できます。';
         drawEditor();
       } catch (err) {
-        statusText.textContent = '音声ファイルの読み込みに失敗しました。';
+        console.error(err);
+        statusText.textContent = 'ファイルの読み込みに失敗しました。対応フォーマットか確認してください。';
       }
     });
 
-    // 2. 録音処理（開始直後のポップノイズ対策を適用）
+    // 2. 録音処理
     recBtn.addEventListener('click', async () => {
       await Tone.start();
 
@@ -122,7 +125,7 @@
       }
     });
 
-    // 3. 超高精度ピッチ解析（YINアルゴリズム＋ノイズフィルター）
+    // 3. ピッチ解析（YINアルゴリズム＋アタックノイズスキップ）
     function analyzeAudioNotes() {
       pitchCurvePoints = [];
       if (!audioBuffer) return;
@@ -134,9 +137,7 @@
       const windowSize = Math.floor(sampleRate * 0.04);
       const totalFrames = Math.floor((data.length - windowSize) / samplesPerFrame);
 
-      // 録音直後150msはノイズ対策としてカット
-      const skipFrames = Math.floor(0.15 * 120);
-
+      const skipFrames = Math.floor(0.15 * 120); // 最初150msのタップ音スキップ
       let detectedMidiss = [];
 
       for (let i = 0; i < totalFrames; i++) {
@@ -146,7 +147,6 @@
 
         let midiFloat = null;
 
-        // 録音直後の飛び跳ね防止スキップ
         if (i >= skipFrames) {
           midiFloat = detectPitchYIN(slice, sampleRate);
         }
@@ -162,9 +162,7 @@
         }
       }
 
-      // 異常値（オクターブ誤検知）のメディアンフィルタリングによる平滑化
       smoothPitchCurve();
-
       rawPitchPoints = JSON.parse(JSON.stringify(pitchCurvePoints));
 
       if (detectedMidiss.length > 0) {
@@ -173,12 +171,11 @@
       }
     }
 
-    // YIN Pitch Detection Algorithm (倍音・高音ノイズ誤検知に非常に強力)
     function detectPitchYIN(buffer, sampleRate) {
       let sum = 0;
       for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
       let rms = Math.sqrt(sum / buffer.length);
-      if (rms < 0.012) return null; // ノイズフロア設定
+      if (rms < 0.012) return null;
 
       const yinBuffer = new Float32Array(Math.floor(buffer.length / 2));
       for (let tau = 0; tau < yinBuffer.length; tau++) {
@@ -210,12 +207,11 @@
       if (tauFound === -1) return null;
 
       const freq = sampleRate / tauFound;
-      if (freq < 70 || freq > 1100) return null; // 人声の可聴・実用範囲に限定
+      if (freq < 70 || freq > 1100) return null;
 
       return 12 * Math.log2(freq / 440) + 69;
     }
 
-    // ピッチ曲線の平滑化
     function smoothPitchCurve() {
       for (let i = 1; i < pitchCurvePoints.length - 1; i++) {
         const prev = pitchCurvePoints[i - 1].midi;
@@ -224,20 +220,19 @@
 
         if (curr !== null && prev !== null && next !== null) {
           if (Math.abs(curr - prev) > 5 && Math.abs(curr - next) > 5) {
-            pitchCurvePoints[i].midi = (prev + next) / 2; // スパイクノイズ除去
+            pitchCurvePoints[i].midi = (prev + next) / 2;
           }
         }
       }
     }
 
-    // リセット処理
     resetBtn.addEventListener('click', () => {
       pitchCurvePoints = JSON.parse(JSON.stringify(rawPitchPoints));
       drawEditor();
       statusText.textContent = 'ピッチカーブを初期状態に戻しました。';
     });
 
-    // 4. トーン崩れ防止機能付き再生処理
+    // 4. 再生処理
     let isPlaying = false;
     playBtn.addEventListener('click', async () => {
       if (!audioBuffer || isPlaying) return;
@@ -250,7 +245,7 @@
       const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
       
       const pitchShift = new Tone.PitchShift({ pitch: 0 }).toDestination();
-      pitchShift.windowSize = 0.08; // トーンの不自然さを抑えるウィンドウ設定
+      pitchShift.windowSize = 0.08;
       const player = new Tone.Player(toneBuffer).connect(pitchShift);
 
       const startTime = Tone.now();
@@ -270,7 +265,6 @@
 
         const currentPt = pitchCurvePoints.find(p => p.time >= elapsed);
         if (currentPt && currentPt.midi !== null && currentPt.originalMidi !== null) {
-          // 急激な変更のトーン変化を滑らかに補正
           pitchShift.pitch = currentPt.midi - currentPt.originalMidi;
         }
 
@@ -278,53 +272,71 @@
       }, 10);
     });
 
-    // 5. 安定化WAVダウンロード機能（クロスフェード処理でトーン崩れを防止）
+    // 5. エラー回避・高速WAVレンダリング＆ダウンロード処理
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
-      statusText.textContent = 'WAVファイルを高音質レンダリング中...';
+      statusText.textContent = 'WAVファイルを生成中...';
 
       try {
         const sampleRate = audioBuffer.sampleRate;
         const numChannels = audioBuffer.numberOfChannels;
         const length = audioBuffer.length;
 
-        const offlineCtx = new Tone.OfflineAudioContext(numChannels, length / sampleRate, sampleRate);
-        const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
-        const pitchShift = new Tone.PitchShift({ pitch: 0 }).toDestination();
-        pitchShift.windowSize = 0.08;
+        const actx = new (window.AudioContext || window.webkitAudioContext)();
+        const outBuffer = actx.createBuffer(numChannels, length, sampleRate);
 
-        const player = new Tone.Player(toneBuffer).connect(pitchShift);
-        player.start(0);
+        for (let ch = 0; ch < numChannels; ch++) {
+          const inputData = audioBuffer.getChannelData(ch);
+          const outputData = outBuffer.getChannelData(ch);
+          
+          let readPos = 0;
+          for (let i = 0; i < length; i++) {
+            const time = i / sampleRate;
+            const frameIdx = Math.min(
+              pitchCurvePoints.length - 1,
+              Math.floor(time * 120)
+            );
+            const pt = pitchCurvePoints[frameIdx];
 
-        // 時間軸で変化するピッチオートメーションをセット
-        pitchCurvePoints.forEach(pt => {
-          if (pt.midi !== null && pt.originalMidi !== null) {
-            const shift = pt.midi - pt.originalMidi;
-            pitchShift.pitch = shift;
+            let shift = 0;
+            if (pt && pt.midi !== null && pt.originalMidi !== null) {
+              shift = pt.midi - pt.originalMidi;
+            }
+
+            const speed = Math.pow(2, shift / 12);
+            readPos += speed;
+            
+            const srcIdx = Math.floor(readPos) % length;
+            outputData[i] = inputData[srcIdx];
           }
-        });
+        }
 
-        const renderedBuffer = await offlineCtx.render();
-        const wavBlob = audioBufferToWav(renderedBuffer.get());
-        
+        const wavBlob = audioBufferToWav(outBuffer);
         const url = URL.createObjectURL(wavBlob);
+        
         const a = document.createElement('a');
+        a.style.display = 'none';
         a.href = url;
-        a.download = 'pitch_edited_high_quality.wav';
+        a.download = 'pitch_edited.wav';
+        document.body.appendChild(a);
         a.click();
-        URL.revokeObjectURL(url);
+        
+        setTimeout(() => {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }, 200);
 
-        statusText.textContent = '高音質WAVファイルのダウンロードが完了しました！';
+        statusText.textContent = 'WAVファイルのダウンロードが完了しました！';
       } catch (err) {
         console.error(err);
-        statusText.textContent = 'ダウンロード処理中にエラーが発生しました。';
+        statusText.textContent = 'ダウンロードエラーが発生しました。';
       }
     });
 
     function audioBufferToWav(buffer) {
       const numOfChan = buffer.numberOfChannels;
       const sampleRate = buffer.sampleRate;
-      const format = 1;
+      const format = 1; // 16bit PCM
       const bitDepth = 16;
       
       let samples = buffer.getChannelData(0);
@@ -363,7 +375,7 @@
       return new Blob([view], { type: 'audio/wav' });
     }
 
-    // 画面描画
+    // 6. エディタ描画
     function drawEditor(playProgress = null) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const noteHeight = canvas.height / DISPLAY_NOTES;
@@ -449,7 +461,7 @@
       }
     }
 
-    // 滑らかな「びよーん」変形インタラクション（トーン崩れを防止する影響範囲のスムージング）
+    // 7. インタラクション処理
     let isDragging = false;
     let isTwoFingerScroll = false;
     let dragCenterIdx = -1;
@@ -530,7 +542,6 @@
         const midiDelta = deltaY / noteHeight;
 
         if (Math.abs(midiDelta) > 0.01) {
-          // 影響範囲を拡大し、急激な変形によるケロケロ感・音質劣化を滑らかに防止
           const influenceRadius = 24;
 
           for (let i = -influenceRadius; i <= influenceRadius; i++) {
