@@ -7,16 +7,21 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
   <style>
     body { font-family: sans-serif; background: #1e1e1e; color: #fff; text-align: center; margin: 0; padding: 15px; box-sizing: border-box; }
-    .controls { margin-bottom: 12px; display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 6px; }
-    button, label.btn { padding: 12px 18px; font-size: 15px; font-weight: bold; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; display: inline-block; }
+    .controls { margin-bottom: 12px; display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; }
+    button, label.btn { padding: 10px 16px; font-size: 14px; font-weight: bold; cursor: pointer; border: none; border-radius: 6px; background: #007acc; color: white; -webkit-tap-highlight-color: transparent; display: inline-flex; align-items: center; gap: 4px; }
     button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    #madBtn { background: #9b59b6; }
     #downloadBtn { background: #28a745; }
     #downloadBtn:disabled { background: #444; }
     #resetBtn { background: #dc3545; }
     #resetBtn:disabled { background: #444; }
     #fileInput { display: none; }
+    
+    .lock-container { display: inline-flex; align-items: center; gap: 6px; background: #333; padding: 6px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; cursor: pointer; user-select: none; }
+    .lock-container input { cursor: pointer; }
+
     #canvas-container { width: 100%; max-width: 900px; margin: 0 auto; touch-action: none; position: relative; }
-    #editor { width: 100%; height: 380px; border: 1px solid #444; background: #252526; display: block; border-radius: 6px; }
+    #editor { width: 100%; height: 380px; border: 1px solid #444; background: #252526; display: block; border-radius: 6px; cursor: pointer; }
     .status { margin-top: 10px; color: #aaa; font-size: 14px; }
   </style>
 </head>
@@ -25,33 +30,48 @@
   <h1>Melodyne Style Pitch Editor</h1>
   
   <div class="controls">
+    <label class="lock-container">
+      <input type="checkbox" id="recLock"> 録音ロック
+    </label>
     <button id="recBtn">録音開始</button>
-    <label class="btn" for="fileInput">音声/動画ファイル読み込み</label>
-    <!-- 音声・動画ファイルを一括許可 -->
+    <label class="btn" for="fileInput">ファイル読み込み</label>
     <input type="file" id="fileInput" accept="audio/*,video/*,video/mp4,.wav,.mp3,.mp4,.mov,.webm">
+    
     <button id="playBtn" disabled>再生</button>
-    <button id="resetBtn" disabled>ピッチリセット</button>
-    <button id="downloadBtn" disabled>WAVダウンロード</button>
+    <button id="stopBtn" disabled>停止</button>
+    <button id="madBtn" disabled>MAD化 (Auto-Tune)</button>
+    <button id="resetBtn" disabled>リセット</button>
+    <button id="downloadBtn" disabled>WAV出力</button>
   </div>
 
   <div id="canvas-container">
     <canvas id="editor" width="900" height="380"></canvas>
   </div>
-  <div class="status" id="statusText">【1本指ドラッグ】波形を「びよーん」と変形 / 【2本指】画面スクロール</div>
+  <div class="status" id="statusText">【クリック/タップ】任意の再生位置を指定 / 【ドラッグ】波形を変形 / 【2本指】スクロール</div>
 
   <script>
     let mediaRecorder;
     let audioChunks = [];
     let audioBuffer = null;
-    let pitchCurvePoints = []; // 1秒間に120回の高精度ピッチデータ
+    let pitchCurvePoints = [];
     let rawPitchPoints = [];
 
     const KEY_WIDTH = 70;
     const DISPLAY_NOTES = 25;
     let baseMidi = 60;
 
+    // 再生状態管理
+    let isPlaying = false;
+    let currentPlayTime = 0;
+    let activePlayer = null;
+    let activePitchShift = null;
+    let animationFrameId = null;
+
+    const recLock = document.getElementById('recLock');
     const recBtn = document.getElementById('recBtn');
     const playBtn = document.getElementById('playBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const madBtn = document.getElementById('madBtn');
     const resetBtn = document.getElementById('resetBtn');
     const downloadBtn = document.getElementById('downloadBtn');
     const fileInput = document.getElementById('fileInput');
@@ -63,33 +83,43 @@
 
     drawEditor();
 
-    // 1. 音声・動画ファイル読み込み処理（MP4, MOV, WAV, MP3等に完全対応）
+    // 音声・動画ファイル読み込み
     fileInput.addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
 
+      stopAudio();
       statusText.textContent = 'メディアファイルを解析中...';
       try {
         const arrayBuffer = await file.arrayBuffer();
         const actx = new (window.AudioContext || window.webkitAudioContext)();
-        
-        // 動画ファイルであっても音声トラックを自動抽出してデコード
         audioBuffer = await actx.decodeAudioData(arrayBuffer);
+        
         analyzeAudioNotes();
-        playBtn.disabled = false;
-        resetBtn.disabled = false;
-        downloadBtn.disabled = false;
-        statusText.textContent = 'ファイルの読み込み完了。ピッチカーブを「びよーん」と変形できます。';
+        enableControls();
+        currentPlayTime = 0;
+        statusText.textContent = '読み込み完了。ピッチ編集や「MAD化」が可能です。';
         drawEditor();
       } catch (err) {
         console.error(err);
-        statusText.textContent = 'ファイルの読み込みに失敗しました。対応フォーマットか確認してください。';
+        statusText.textContent = 'ファイルの読み込みに失敗しました。';
       }
     });
 
-    // 2. 録音処理
+    // 録音ロック機能
+    recLock.addEventListener('change', () => {
+      if (recLock.checked) {
+        recBtn.disabled = true;
+      } else {
+        recBtn.disabled = false;
+      }
+    });
+
+    // 録音処理
     recBtn.addEventListener('click', async () => {
+      if (recLock.checked) return;
       await Tone.start();
+      stopAudio();
 
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
@@ -109,23 +139,30 @@
             audioBuffer = await actx.decodeAudioData(arrayBuffer);
             
             analyzeAudioNotes();
-            playBtn.disabled = false;
-            resetBtn.disabled = false;
-            downloadBtn.disabled = false;
-            statusText.textContent = '波形の一部分をドラッグして「びよーん」と自由に変形できます。';
+            enableControls();
+            currentPlayTime = 0;
+            statusText.textContent = '録音完了。波形を変形したり「MAD化」ボタンを試してください。';
             drawEditor();
           };
 
           mediaRecorder.start();
           recBtn.textContent = '録音停止';
-          statusText.textContent = '録音中... 声を出してください。';
+          statusText.textContent = '録音中...';
         } catch (err) {
           statusText.textContent = 'マイクのアクセスを許可してください。';
         }
       }
     });
 
-    // 3. ピッチ解析（YINアルゴリズム＋アタックノイズスキップ）
+    function enableControls() {
+      playBtn.disabled = false;
+      stopBtn.disabled = false;
+      madBtn.disabled = false;
+      resetBtn.disabled = false;
+      downloadBtn.disabled = false;
+    }
+
+    // ピッチ解析（録音開始時の異常高音跳ね上がり防止補正つき）
     function analyzeAudioNotes() {
       pitchCurvePoints = [];
       if (!audioBuffer) return;
@@ -137,7 +174,9 @@
       const windowSize = Math.floor(sampleRate * 0.04);
       const totalFrames = Math.floor((data.length - windowSize) / samplesPerFrame);
 
-      const skipFrames = Math.floor(0.15 * 120); // 最初150msのタップ音スキップ
+      // 開始約0.3秒間のポップノイズ/過大入力対策期間
+      const initialGuardFrames = Math.floor(0.3 * 120);
+
       let detectedMidiss = [];
 
       for (let i = 0; i < totalFrames; i++) {
@@ -145,10 +184,13 @@
         const slice = data.subarray(startSample, startSample + windowSize);
         const time = startSample / sampleRate;
 
-        let midiFloat = null;
+        let midiFloat = detectPitchYIN(slice, sampleRate);
 
-        if (i >= skipFrames) {
-          midiFloat = detectPitchYIN(slice, sampleRate);
+        // 録音最初期の極端な高音スパイクを検出して補正除去
+        if (i < initialGuardFrames && midiFloat !== null) {
+          if (midiFloat > 82) { // hiC以上の異常跳ね上がりをキャンセル
+            midiFloat = null;
+          }
         }
 
         pitchCurvePoints.push({
@@ -171,11 +213,12 @@
       }
     }
 
+    // YIN アルゴリズム
     function detectPitchYIN(buffer, sampleRate) {
       let sum = 0;
       for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
       let rms = Math.sqrt(sum / buffer.length);
-      if (rms < 0.012) return null;
+      if (rms < 0.015) return null;
 
       const yinBuffer = new Float32Array(Math.floor(buffer.length / 2));
       for (let tau = 0; tau < yinBuffer.length; tau++) {
@@ -207,11 +250,12 @@
       if (tauFound === -1) return null;
 
       const freq = sampleRate / tauFound;
-      if (freq < 70 || freq > 1100) return null;
+      if (freq < 75 || freq > 1000) return null;
 
       return 12 * Math.log2(freq / 440) + 69;
     }
 
+    // 先頭・途中の飛び跳ねノイズ補正
     function smoothPitchCurve() {
       for (let i = 1; i < pitchCurvePoints.length - 1; i++) {
         const prev = pitchCurvePoints[i - 1].midi;
@@ -219,60 +263,117 @@
         const next = pitchCurvePoints[i + 1].midi;
 
         if (curr !== null && prev !== null && next !== null) {
-          if (Math.abs(curr - prev) > 5 && Math.abs(curr - next) > 5) {
+          if (Math.abs(curr - prev) > 4 && Math.abs(curr - next) > 4) {
             pitchCurvePoints[i].midi = (prev + next) / 2;
           }
         }
       }
     }
 
+    // 喋り声をMAD風にするAuto-Tune機能
+    madBtn.addEventListener('click', () => {
+      if (!audioBuffer) return;
+      
+      // 連続した音程を正確な音階（半音単位）へクオンタイズ
+      pitchCurvePoints.forEach(pt => {
+        if (pt.midi !== null) {
+          pt.midi = Math.round(pt.midi);
+        }
+      });
+
+      drawEditor();
+      statusText.textContent = '喋り声を音MAD風（Auto-Tune）に補正しました。';
+    });
+
     resetBtn.addEventListener('click', () => {
       pitchCurvePoints = JSON.parse(JSON.stringify(rawPitchPoints));
       drawEditor();
-      statusText.textContent = 'ピッチカーブを初期状態に戻しました。';
+      statusText.textContent = 'ピッチカーブをリセットしました。';
     });
 
-    // 4. 再生処理
-    let isPlaying = false;
+    // トランスポート再生 / 一時停止
     playBtn.addEventListener('click', async () => {
-      if (!audioBuffer || isPlaying) return;
+      if (!audioBuffer) return;
       await Tone.start();
 
+      if (isPlaying) {
+        pauseAudio();
+      } else {
+        startAudio(currentPlayTime);
+      }
+    });
+
+    // 完全停止
+    stopBtn.addEventListener('click', () => {
+      stopAudio();
+      currentPlayTime = 0;
+      drawEditor();
+    });
+
+    function startAudio(offsetTime = 0) {
+      if (!audioBuffer) return;
+      stopAudio();
+
       isPlaying = true;
-      playBtn.disabled = true;
+      playBtn.textContent = '一時停止';
 
       const duration = audioBuffer.duration;
+      if (offsetTime >= duration) offsetTime = 0;
+
       const toneBuffer = new Tone.ToneAudioBuffer(audioBuffer);
+      activePitchShift = new Tone.PitchShift({ pitch: 0 }).toDestination();
+      activePitchShift.windowSize = 0.08;
       
-      const pitchShift = new Tone.PitchShift({ pitch: 0 }).toDestination();
-      pitchShift.windowSize = 0.08;
-      const player = new Tone.Player(toneBuffer).connect(pitchShift);
+      activePlayer = new Tone.Player(toneBuffer).connect(activePitchShift);
 
-      const startTime = Tone.now();
-      player.start(startTime);
+      const startTime = Tone.now() - offsetTime;
+      activePlayer.start(Tone.now(), offsetTime);
 
-      const updateInterval = setInterval(() => {
+      function loop() {
+        if (!isPlaying) return;
         const elapsed = Tone.now() - startTime;
+        currentPlayTime = elapsed;
+
         if (elapsed >= duration) {
-          clearInterval(updateInterval);
-          player.dispose();
-          pitchShift.dispose();
-          isPlaying = false;
-          playBtn.disabled = false;
+          stopAudio();
+          currentPlayTime = 0;
           drawEditor();
           return;
         }
 
         const currentPt = pitchCurvePoints.find(p => p.time >= elapsed);
         if (currentPt && currentPt.midi !== null && currentPt.originalMidi !== null) {
-          pitchShift.pitch = currentPt.midi - currentPt.originalMidi;
+          activePitchShift.pitch = currentPt.midi - currentPt.originalMidi;
         }
 
         drawEditor(elapsed / duration);
-      }, 10);
-    });
+        animationFrameId = requestAnimationFrame(loop);
+      }
+      loop();
+    }
 
-    // 5. エラー回避・高速WAVレンダリング＆ダウンロード処理
+    function pauseAudio() {
+      if (activePlayer) {
+        try { activePlayer.stop(); } catch(e){}
+      }
+      isPlaying = false;
+      playBtn.textContent = '再生';
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+    }
+
+    function stopAudio() {
+      pauseAudio();
+      if (activePlayer) {
+        try { activePlayer.dispose(); } catch(e){}
+        activePlayer = null;
+      }
+      if (activePitchShift) {
+        try { activePitchShift.dispose(); } catch(e){}
+        activePitchShift = null;
+      }
+    }
+
+    // WAV出力・ダウンロード
     downloadBtn.addEventListener('click', async () => {
       if (!audioBuffer) return;
       statusText.textContent = 'WAVファイルを生成中...';
@@ -317,7 +418,7 @@
         const a = document.createElement('a');
         a.style.display = 'none';
         a.href = url;
-        a.download = 'pitch_edited.wav';
+        a.download = 'pitch_edited_mad.wav';
         document.body.appendChild(a);
         a.click();
         
@@ -336,7 +437,7 @@
     function audioBufferToWav(buffer) {
       const numOfChan = buffer.numberOfChannels;
       const sampleRate = buffer.sampleRate;
-      const format = 1; // 16bit PCM
+      const format = 1;
       const bitDepth = 16;
       
       let samples = buffer.getChannelData(0);
@@ -375,7 +476,7 @@
       return new Blob([view], { type: 'audio/wav' });
     }
 
-    // 6. エディタ描画
+    // 画面描画
     function drawEditor(playProgress = null) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       const noteHeight = canvas.height / DISPLAY_NOTES;
@@ -443,15 +544,15 @@
         });
         ctx.stroke();
 
-        if (playProgress !== null) {
-          const playX = KEY_WIDTH + playProgress * timelineWidth;
-          ctx.strokeStyle = '#00ffff';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.moveTo(playX, 0);
-          ctx.lineTo(playX, canvas.height);
-          ctx.stroke();
-        }
+        // 現在の再生位置ヘッダー（水色ライン）
+        const currentProgress = playProgress !== null ? playProgress : (currentPlayTime / totalDuration);
+        const playX = KEY_WIDTH + currentProgress * timelineWidth;
+        ctx.strokeStyle = '#00ffff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(playX, 0);
+        ctx.lineTo(playX, canvas.height);
+        ctx.stroke();
 
       } else if (!audioBuffer) {
         ctx.fillStyle = '#666';
@@ -461,12 +562,13 @@
       }
     }
 
-    // 7. インタラクション処理
+    // インタラクション（任意の再生位置指定 / ドラッグ変形）
     let isDragging = false;
     let isTwoFingerScroll = false;
     let dragCenterIdx = -1;
     let startY = 0;
     let twoFingerStartY = 0;
+    let hasMovedDuringTouch = false;
 
     function getCanvasCoords(e) {
       const rect = canvas.getBoundingClientRect();
@@ -481,6 +583,8 @@
     }
 
     function handleStart(e) {
+      hasMovedDuringTouch = false;
+
       if (e.touches && e.touches.length === 2) {
         isTwoFingerScroll = true;
         isDragging = false;
@@ -509,16 +613,27 @@
         }
       });
 
-      if (closestIdx !== -1 && minDistance < 0.25) {
+      // 波形の近くを選択した場合は変形ドラッグ、それ以外は再生位置の移動
+      if (closestIdx !== -1 && minDistance < 0.2) {
         isDragging = true;
         isTwoFingerScroll = false;
         dragCenterIdx = closestIdx;
         startY = pos.y;
-        if (e.cancelable) e.preventDefault();
+      } else {
+        // クリックした任意の場所に再生ヘッドを移動して再生開始
+        currentPlayTime = clickedTime;
+        if (isPlaying) {
+          startAudio(currentPlayTime);
+        } else {
+          drawEditor();
+        }
       }
+      if (e.cancelable) e.preventDefault();
     }
 
     function handleMove(e) {
+      hasMovedDuringTouch = true;
+
       if (isTwoFingerScroll && e.touches && e.touches.length === 2) {
         const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
         const deltaY = currentY - twoFingerStartY;
